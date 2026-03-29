@@ -7,6 +7,16 @@ FastAPI server that handles:
 - Video-based caching to avoid reprocessing
 """
 
+import sys
+
+# Windows consoles often use cp1252; emoji in print() would crash startup.
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except (OSError, ValueError, AttributeError):
+        pass
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -101,10 +111,34 @@ async def ask_question(request: AskRequest) -> AskResponse:
     except HTTPException:
         raise
     except Exception as e:
-        print(f"Error processing question: {str(e)}")
+        error_msg = str(e)
+        print(f"Error processing question: {error_msg}")
+        
+        # Provide more user-friendly error messages
+        if "Unable to retrieve transcript" in error_msg:
+            detail = (
+                f"Transcript Error: {error_msg}\n\n"
+                f"This is a common issue with YouTube's transcript service. "
+                f"The suggestions above usually help resolve it."
+            )
+        elif "HuggingFace API not configured" in error_msg:
+            detail = (
+                f"Configuration Error: {error_msg}\n\n"
+                f"Please set up your HUGGINGFACEHUB_API_TOKEN in the .env file "
+                f"in the backend directory."
+            )
+        elif "Error generating answer from HuggingFace" in error_msg:
+            detail = (
+                f"AI Generation Error: {error_msg}\n\n"
+                f"Please check your HuggingFace API token and internet connection, "
+                f"then try again."
+            )
+        else:
+            detail = f"Error processing your question: {error_msg}"
+        
         raise HTTPException(
             status_code=500,
-            detail=f"Error processing your question: {str(e)}"
+            detail=detail
         )
 
 @app.get("/status", tags=["Status"])
@@ -113,17 +147,17 @@ async def get_status():
     return {
         "status": "running",
         "cached_videos": len(rag_pipeline.cache),
-        "gemini_configured": rag_pipeline.is_gemini_configured
+        "llm_configured": rag_pipeline.is_huggingface_configured
     }
 
 if __name__ == "__main__":
     import uvicorn
     
-    # Check if Gemini API key is configured
-    if not os.getenv('GEMINI_API_KEY'):
-        print("⚠️  WARNING: GEMINI_API_KEY not set in .env file")
+    # Check if HuggingFace API token is configured
+    if not os.getenv('HUGGINGFACEHUB_API_TOKEN'):
+        print("⚠️  WARNING: HUGGINGFACEHUB_API_TOKEN not set in .env file")
         print("   The backend will fail when trying to generate answers.")
-        print("   Please add your Gemini API key to .env")
+        print("   Please add your HuggingFace API token to .env")
     
     print("🚀 Starting YouTube RAG Backend...")
     print("📍 Server: http://localhost:8000")

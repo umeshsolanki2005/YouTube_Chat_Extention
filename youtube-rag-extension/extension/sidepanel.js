@@ -11,6 +11,9 @@
 const BACKEND_URL = 'http://localhost:8000';
 const DEBOUNCE_DELAY = 1000;
 
+/** Last known result of GET /health — used so loading state and badges stay consistent */
+let backendReachable = false;
+
 // DOM elements
 const videoTitleEl = document.getElementById('videoTitle');
 const videoIdEl = document.getElementById('videoId');
@@ -29,82 +32,85 @@ let isLoading = false;
 let lastRequestTime = 0;
 let chatHistory = [];
 
-// Extract video ID from URL
-function extractVideoIdFromUrl(url) {
-  try {
-    const urlObj = new URL(url);
-    
-    // Method 1: youtube.com/watch?v=VIDEO_ID
-    if (urlObj.hostname.includes('youtube.com')) {
-      const videoId = urlObj.searchParams.get('v');
-      if (videoId) {
-        console.log('[SidePanel] Video ID from youtube.com:', videoId);
-        return videoId;
-      }
-    }
-    
-    // Method 2: youtu.be/VIDEO_ID
-    if (urlObj.hostname.includes('youtu.be')) {
-      const videoId = urlObj.pathname.slice(1);
-      if (videoId) {
-        console.log('[SidePanel] Video ID from youtu.be:', videoId);
-        return videoId;
-      }
-    }
-  } catch (error) {
-    console.error('[SidePanel] Error extracting video ID:', error);
+function applyVideoPayload(payload) {
+  if (payload?.videoId) {
+    currentVideoId = payload.videoId;
+    currentVideoUrl = payload.videoUrl || null;
+    videoTitleEl.textContent = payload.videoTitle || 'YouTube Video';
+    videoIdEl.textContent = `ID: ${payload.videoId}`;
+    videoIdEl.style.display = 'block';
+    questionInputEl.disabled = false;
+    askButtonEl.disabled = false;
+    console.info('[SidePanel] Video:', payload.videoId, payload.videoTitle);
+  } else {
+    currentVideoId = null;
+    currentVideoUrl = null;
+    videoTitleEl.textContent = 'No video selected';
+    videoIdEl.textContent = '';
+    videoIdEl.style.display = 'none';
+    questionInputEl.disabled = true;
+    askButtonEl.disabled = true;
   }
-  
-  return null;
 }
 
-// Get current active tab's video info directly
-function getTabVideoInfo() {
-  console.log('[SidePanel] Getting tab info...');
-  
-  chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-    if (tabs && tabs[0]) {
-      const tab = tabs[0];
-      console.log('[SidePanel] Current tab URL:', tab.url);
-      
-      const videoId = extractVideoIdFromUrl(tab.url);
-      
-      if (videoId) {
-        currentVideoId = videoId;
-        currentVideoUrl = tab.url;
-        
-        // Update UI
-        videoIdEl.textContent = `ID: ${videoId}`;
-        videoIdEl.style.display = 'block';
-        questionInputEl.disabled = false;
-        askButtonEl.disabled = false;
-        
-        console.log('[SidePanel] Successfully detected video:', videoId);
-      } else {
-        // No video detected
-        videoIdEl.textContent = 'No video ID detected';
-        videoIdEl.style.display = 'block';
-        questionInputEl.disabled = true;
-        askButtonEl.disabled = true;
-        
-        console.log('[SidePanel] No video detected on current tab');
-      }
+/**
+ * Resolve video from the service worker using the real tab URL + per-tab cache (avoids stale titles/IDs).
+ */
+function refreshVideoInfoFromStorage() {
+  chrome.runtime.sendMessage({ type: 'GET_VIDEO_FOR_PANEL' }, (response) => {
+    if (chrome.runtime.lastError) {
+      console.warn('[SidePanel] GET_VIDEO_FOR_PANEL:', chrome.runtime.lastError.message);
+      refreshVideoInfoFromStorageFallback(() => checkBackendHealth());
+      return;
     }
-    
-    // Check backend health
-    checkBackendHealth();
+
+    if (response?.ok && response.videoId) {
+      applyVideoPayload(response);
+      checkBackendHealth();
+    } else {
+      refreshVideoInfoFromStorageFallback(() => checkBackendHealth());
+    }
   });
+}
+
+function refreshVideoInfoFromStorageFallback(done) {
+  chrome.storage.local.get(
+    ['currentVideoId', 'currentVideoUrl', 'currentVideoTitle'],
+    (data) => {
+      if (chrome.runtime.lastError) {
+        console.error('[SidePanel] storage:', chrome.runtime.lastError);
+        if (done) done();
+        return;
+      }
+      if (data.currentVideoId) {
+        applyVideoPayload({
+          videoId: data.currentVideoId,
+          videoUrl: data.currentVideoUrl,
+          videoTitle: data.currentVideoTitle,
+        });
+      } else {
+        applyVideoPayload(null);
+      }
+      if (done) done();
+    }
+  );
 }
 
 console.log('[SidePanel] Script loaded');
 
 // Initialize on panel open
-getTabVideoInfo();
+refreshVideoInfoFromStorage();
 
-// Periodically refresh (every 2 seconds)
+chrome.storage.onChanged.addListener((changes, areaName) => {
+  if (areaName !== 'local') return;
+  if (changes.currentVideoId || changes.currentVideoUrl || changes.currentVideoTitle) {
+    refreshVideoInfoFromStorage();
+  }
+});
+
+// Periodically refresh storage + health (every 2 seconds)
 setInterval(() => {
-  console.log('[SidePanel] Periodic refresh...');
-  getTabVideoInfo();
+  refreshVideoInfoFromStorage();
 }, 2000);
 
 // Check if backend is running
@@ -112,14 +118,33 @@ async function checkBackendHealth() {
   try {
     const response = await fetch(`${BACKEND_URL}/health`);
     if (response.ok) {
-      statusBadgeEl.textContent = 'Ready';
-      statusBadgeEl.classList.remove('error');
+      backendReachable = true;
+      if (!isLoading) {
+        statusBadgeEl.textContent = 'Ready';
+        statusBadgeEl.classList.remove('error');
+      }
       backendStatusEl.textContent = '✓ Backend connected';
       backendStatusEl.classList.remove('error');
+      // Stale banner from a failed /ask "connection" error should not contradict health
+      const errText = errorMessageEl.textContent || '';
+      if (errText.includes('Cannot connect to backend')) {
+        clearError();
+      }
+    } else {
+      backendReachable = false;
+      if (!isLoading) {
+        statusBadgeEl.textContent = 'Backend Error';
+        statusBadgeEl.classList.add('error');
+      }
+      backendStatusEl.textContent = '✗ Backend returned ' + response.status;
+      backendStatusEl.classList.add('error');
     }
   } catch (error) {
-    statusBadgeEl.textContent = 'Backend Error';
-    statusBadgeEl.classList.add('error');
+    backendReachable = false;
+    if (!isLoading) {
+      statusBadgeEl.textContent = 'Backend offline';
+      statusBadgeEl.classList.add('error');
+    }
     backendStatusEl.textContent = '✗ Backend not reachable at ' + BACKEND_URL;
     backendStatusEl.classList.add('error');
   }
@@ -195,12 +220,31 @@ async function handleAsk() {
     console.error('Error calling backend:', error);
     
     let errorMsg = error.message;
+    
+    // Handle specific error types with better user messages
     if (error.message.includes('Failed to fetch')) {
       errorMsg = `Cannot connect to backend at ${BACKEND_URL}. Make sure the Python FastAPI server is running.`;
+      backendReachable = false;
+    } else if (error.message.includes('Transcript Error')) {
+      // Extract the transcript error and provide actionable suggestions
+      const transcriptError = error.message.replace('Transcript Error: ', '');
+      errorMsg = `📝 Transcript Issue: ${transcriptError.split('\n\n')[0]}`;
+      
+      // Add suggestions to the error display
+      if (transcriptError.includes('Suggestions:')) {
+        const suggestions = transcriptError.split('Suggestions:')[1].trim();
+        errorMsg += `\n\n💡 Suggestions: ${suggestions}`;
+      }
+    } else if (error.message.includes('Configuration Error')) {
+      errorMsg = `⚙️ Configuration Error: Please check your backend setup and API keys.`;
+    } else if (error.message.includes('AI Generation Error')) {
+      errorMsg = `🤖 AI Error: Unable to generate response. Please try again.`;
     }
     
     showError(errorMsg);
-    updateBackendStatus('error', errorMsg);
+    // Short footer only — full text stays in the banner (avoids two identical red blocks)
+    backendStatusEl.textContent = '✗ Last request failed — see message above';
+    backendStatusEl.classList.add('error');
     
     // Remove the user message from history on error
     if (chatHistory.length > 0 && chatHistory[chatHistory.length - 1].role === 'user') {
@@ -251,13 +295,20 @@ function clearChatHistory() {
 function setLoading(loading) {
   isLoading = loading;
   loadingSpinnerEl.style.display = loading ? 'flex' : 'none';
-  askButtonEl.disabled = loading;
-  questionInputEl.disabled = loading;
+  const blockInput = loading || !currentVideoId;
+  askButtonEl.disabled = blockInput;
+  questionInputEl.disabled = blockInput;
   
   if (loading) {
     statusBadgeEl.textContent = 'Loading...';
+    statusBadgeEl.classList.remove('error');
   } else {
-    statusBadgeEl.textContent = 'Ready';
+    statusBadgeEl.textContent = backendReachable ? 'Ready' : 'Backend offline';
+    if (backendReachable) {
+      statusBadgeEl.classList.remove('error');
+    } else {
+      statusBadgeEl.classList.add('error');
+    }
   }
 }
 
@@ -272,16 +323,11 @@ function clearError() {
   errorMessageEl.textContent = '';
 }
 
-// Backend status
-function updateBackendStatus(status, message = '') {
+// Backend status (after a successful /ask only; connection errors use the banner + short footer)
+function updateBackendStatus(status) {
   if (status === 'success') {
     backendStatusEl.textContent = '✓ Backend connected and responding';
     backendStatusEl.classList.remove('error');
-  } else if (status === 'error') {
-    backendStatusEl.textContent = '✗ Backend error: ' + message;
-    backendStatusEl.classList.add('error');
   }
 }
 
-// Check backend health periodically
-setInterval(checkBackendHealth, 10000);

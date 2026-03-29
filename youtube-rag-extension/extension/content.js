@@ -1,126 +1,114 @@
 /**
  * Content Script for YouTube RAG Chatbot
- * Detects current YouTube video and notifies background script
+ * Detects current YouTube video and notifies the service worker (per-tab storage).
  */
 
-// Extract video ID from YouTube URL - simplified version
 function getVideoIdFromUrl(url) {
-  console.log('[Content] Parsing URL:', url);
-  
-  // Parse URL
   try {
     const urlObj = new URL(url);
-    
-    // Method 1: youtube.com/watch?v=VIDEO_ID
+
     if (urlObj.hostname.includes('youtube.com')) {
       const videoId = urlObj.searchParams.get('v');
-      if (videoId) {
-        console.log('[Content] Found video ID via searchParams:', videoId);
-        return videoId;
-      }
+      if (videoId) return videoId;
     }
-    
-    // Method 2: youtu.be/VIDEO_ID
+
     if (urlObj.hostname.includes('youtu.be')) {
-      const videoId = urlObj.pathname.slice(1);
-      if (videoId) {
-        console.log('[Content] Found video ID via youtu.be:', videoId);
-        return videoId;
-      }
+      const videoId = urlObj.pathname.replace(/^\//, '').split('/')[0];
+      if (videoId && videoId.length >= 6) return videoId;
     }
   } catch (error) {
     console.error('[Content] URL parsing error:', error);
   }
-  
-  console.log('[Content] No video ID found');
+
   return null;
 }
 
-// Get video title from page
 function getVideoTitle() {
-  // YouTube video title - try multiple selectors
   const selectors = [
+    'ytd-watch-metadata h1 yt-formatted-string',
+    'h1.ytd-watch-metadata yt-formatted-string',
+    'ytd-video-primary-info-renderer h1 yt-formatted-string',
     'h1.title yt-formatted-string',
     'yt-formatted-string.title',
     'h1 yt-formatted-string',
-    'ytd-video-primary-info-renderer h1 yt-formatted-string',
-    'h1'
+    'h1',
   ];
-  
+
   for (const selector of selectors) {
     const elements = document.querySelectorAll(selector);
     for (const element of elements) {
-      if (element.textContent && element.textContent.trim().length > 0) {
-        const title = element.textContent.trim();
-        if (!title.includes('YouTube')) { // Avoid generic titles
-          console.log('[Content] Found title:', title);
-          return title;
-        }
+      const text = element.textContent && element.textContent.trim();
+      if (text && text.length > 0 && !text.includes('YouTube')) {
+        return text;
       }
     }
   }
-  
-  console.log('[Content] Using default title');
+
   return 'YouTube Video';
 }
 
-// Send video information to service worker
+let notifyTimer = null;
+
 function notifyVideoInfo() {
   const videoId = getVideoIdFromUrl(window.location.href);
   const videoTitle = getVideoTitle();
-  
-  console.log('[Content] Notifying - Video ID:', videoId, 'Title:', videoTitle);
-  
-  if (videoId) {
-    try {
-      chrome.runtime.sendMessage({
-        type: 'UPDATE_VIDEO_INFO',
-        videoId: videoId,
-        videoUrl: window.location.href,
-        videoTitle: videoTitle
-      }, (response) => {
-        if (chrome.runtime.lastError) {
-          console.error('[Content] Message error:', chrome.runtime.lastError);
-        } else {
-          console.log('[Content] Message sent successfully:', response);
-        }
-      });
-    } catch (error) {
-      console.error('[Content] Failed to send message:', error);
-    }
-  } else {
-    console.warn('[Content] Cannot send message - no video ID detected');
+
+  if (!videoId) {
+    console.warn('[Content] No video ID for URL:', window.location.href);
+    return;
   }
+
+  chrome.runtime.sendMessage(
+    {
+      type: 'UPDATE_VIDEO_INFO',
+      videoId,
+      videoUrl: window.location.href,
+      videoTitle,
+    },
+    (response) => {
+      if (chrome.runtime.lastError) {
+        console.error('[Content] Message error:', chrome.runtime.lastError.message);
+      }
+    }
+  );
 }
 
-console.log('[Content] Script loaded');
+function scheduleNotify() {
+  if (notifyTimer) clearTimeout(notifyTimer);
+  notifyTimer = setTimeout(() => {
+    notifyTimer = null;
+    notifyVideoInfo();
+  }, 120);
+}
 
-// Initial notification
-setTimeout(notifyVideoInfo, 500);
-
-// Watch for URL changes
-let lastUrl = window.location.href;
-const urlCheckInterval = setInterval(() => {
-  if (window.location.href !== lastUrl) {
-    console.log('[Content] URL changed from', lastUrl, 'to', window.location.href);
-    lastUrl = window.location.href;
-    setTimeout(notifyVideoInfo, 500);
+chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  if (msg.type === 'YT_FORCE_REFRESH') {
+    scheduleNotify();
+    sendResponse({ ok: true });
   }
-}, 1000);
-
-// YouTube navigation event
-window.addEventListener('yt-navigate-finish', () => {
-  console.log('[Content] YouTube navigation detected');
-  setTimeout(notifyVideoInfo, 500);
+  return false;
 });
 
-// History changes (back/forward)
-window.addEventListener('popstate', () => {
-  console.log('[Content] History changed');
-  setTimeout(notifyVideoInfo, 500);
-});
+let lastUrl = window.location.href;
 
-// Cleanup
+const urlCheckInterval = setInterval(() => {
+  const href = window.location.href;
+  if (href !== lastUrl) {
+    lastUrl = href;
+    scheduleNotify();
+  }
+}, 400);
+
+setTimeout(scheduleNotify, 300);
+
+window.addEventListener('yt-navigate-finish', () => scheduleNotify());
+
+window.addEventListener('popstate', () => scheduleNotify());
+
+document.addEventListener('yt-page-data-updated', () => scheduleNotify());
+
 window.addEventListener('beforeunload', () => {
   clearInterval(urlCheckInterval);
 });
+
+console.log('[Content] YouTube RAG content script ready');
