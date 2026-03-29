@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>YouTube RAG Chatbot</title>
+    <link rel="stylesheet" href="sidepanel.css">
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <div class="header">
+            <h1>Video RAG Chat</h1>
+            <div class="status-badge" id="statusBadge">Ready</div>
+        </div>
+
+        <!-- Video Info -->
+        <div class="video-info">
+            <div class="info-label">Current Video:</div>
+            <div class="video-title" id="videoTitle">No video selected</div>
+            <div class="video-id" id="videoId"></div>
+        </div>
+
+        <!-- Chat History -->
+        <div class="chat-history" id="chatHistory"></div>
+
+        <!-- Error Display -->
+        <div class="error-message" id="errorMessage" style="display: none;"></div>
+
+        <!-- Loading Spinner -->
+        <div class="loading-spinner" id="loadingSpinner" style="display: none;">
+            <div class="spinner"></div>
+            <div>Processing your question...</div>
+        </div>
+
+        <!-- Input Area -->
+        <div class="input-area">
+            <textarea 
+                id="questionInput" 
+                class="question-input" 
+                placeholder="Ask a question about this video..."
+                rows="3"></textarea>
+            <button id="askButton" class="ask-button">Ask</button>
+        </div>
+
+        <!-- Backend Status -->
+        <div class="backend-status" id="backendStatus"></div>
+    </div>
+
+    <script src="sidepanel.js"></script>
+</body>
+</html>

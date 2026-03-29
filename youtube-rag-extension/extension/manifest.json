@@ -1,0 +1,38 @@
+{
+  "manifest_version": 3,
+  "name": "YouTube Video RAG Chatbot",
+  "version": "1.0.0",
+  "description": "Ask questions about YouTube video transcripts using AI",
+  
+  "permissions": [
+    "scripting",
+    "activeTab",
+    "storage",
+    "sidePanel"
+  ],
+  
+  "host_permissions": [
+    "https://www.youtube.com/*"
+  ],
+  
+  "action": {
+    "default_title": "YouTube RAG Chatbot"
+  },
+  
+  "background": {
+    "service_worker": "service-worker.js"
+  },
+  
+  "content_scripts": [
+    {
+      "matches": ["https://www.youtube.com/*", "https://youtube.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_start",
+      "all_frames": false
+    }
+  ],
+  
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  }
+}
