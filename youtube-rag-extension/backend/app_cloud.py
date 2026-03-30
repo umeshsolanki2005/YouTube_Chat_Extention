@@ -23,12 +23,22 @@ import asyncio
 # Load environment variables
 load_dotenv()
 
-# Global variables
+# Debug: Print environment variables
+print("🔧 Environment Variables:")
+print(f"   PORT: {os.getenv('PORT', 'NOT SET')}")
+print(f"   LLM_PROVIDER: {os.getenv('LLM_PROVIDER', 'NOT SET')}")
+print(f"   USE_CLOUD_PIPELINE: {os.getenv('USE_CLOUD_PIPELINE', 'NOT SET')}")
+print(f"   OPENROUTER_API_KEY: {'SET' if os.getenv('OPENROUTER_API_KEY') else 'NOT SET'}")
+
+# Global variables - MUST use Render's PORT env var
 rag_pipeline = None
 USE_CLOUD_PIPELINE = os.getenv('USE_CLOUD_PIPELINE', 'false').lower() == 'true'
 LLM_PROVIDER = os.getenv('LLM_PROVIDER', 'ollama')
-PORT = int(os.getenv('PORT', 8000))
-HOST = os.getenv('HOST', '0.0.0.0')
+# Render assigns PORT - we MUST use it
+PORT = int(os.environ.get('PORT', 8000))
+HOST = '0.0.0.0'  # Must bind to 0.0.0.0 for Render
+
+print(f"🚀 Config: HOST={HOST}, PORT={PORT}, LLM={LLM_PROVIDER}, CLOUD={USE_CLOUD_PIPELINE}")
 
 async def init_pipeline_async():
     """Initialize RAG pipeline asynchronously"""

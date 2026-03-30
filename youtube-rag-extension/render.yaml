@@ -5,9 +5,8 @@ services:
     name: youtube-rag-bot
     runtime: python
     plan: free
-    rootDir: youtube-rag-extension/backend
-    buildCommand: pip install --timeout 120 --retries 5 -r requirements.txt
-    startCommand: python app_cloud.py
+    buildCommand: cd youtube-rag-extension/backend && pip install --timeout 120 --retries 5 -r requirements.txt
+    startCommand: cd youtube-rag-extension/backend && python app_cloud.py
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.0
@@ -16,7 +15,7 @@ services:
       - key: OPENROUTER_MODEL
         value: meta-llama/llama-3.2-3b-instruct:free
       - key: USE_CLOUD_PIPELINE
-        value: true
+        value: "true"
       - key: ALLOWED_ORIGINS
         value: "*"
     healthCheckPath: /health
