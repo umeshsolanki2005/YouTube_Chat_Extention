@@ -5,8 +5,8 @@ services:
     name: youtube-rag-bot
     runtime: python
     plan: free
-    buildCommand: cd youtube-rag-extension/backend && pip install --timeout 120 --retries 5 -r requirements.txt
-    startCommand: cd youtube-rag-extension/backend && python app_cloud.py
+    buildCommand: cd youtube-rag-extension/backend && pip install --timeout 120 --retries 5 -r requirements-cloud.txt
+    startCommand: cd youtube-rag-extension/backend && uvicorn app_cloud:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.0
@@ -16,6 +16,8 @@ services:
         value: meta-llama/llama-3.2-3b-instruct:free
       - key: USE_CLOUD_PIPELINE
         value: "true"
+      - key: ASK_TIMEOUT_SECONDS
+        value: "55"
       - key: ALLOWED_ORIGINS
         value: "*"
     healthCheckPath: /health

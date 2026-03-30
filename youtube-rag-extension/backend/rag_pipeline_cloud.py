@@ -1,507 +1,294 @@
 """
-Cloud-compatible RAG Pipeline for YouTube Transcript Processing
-Supports both local (Ollama) and cloud (OpenRouter, HuggingFace) LLM providers
+Lightweight cloud RAG pipeline for Render free tier.
+
+Design goals:
+- No local embeddings / FAISS / torch downloads.
+- Use external LLM APIs only (OpenRouter or HuggingFace Inference API).
+- Fast startup and fail-fast behavior for /ask.
+- Background transcript pre-processing to keep request latency low.
 """
 
-import sys
-
-if hasattr(sys.stdout, "reconfigure"):
-    try:
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-    except (OSError, ValueError, AttributeError):
-        pass
-
-import os
-from typing import Optional, Dict, Any
-from youtube_transcript_api import YouTubeTranscriptApi
-from youtube_transcript_api.proxies import GenericProxyConfig
-from youtube_transcript_api._errors import TranscriptsDisabled, NoTranscriptFound, VideoUnavailable, RequestBlocked, IpBlocked
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import FAISS
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_core.prompts import PromptTemplate
 import asyncio
-import requests
-import re
-import time
-import random
-import json
-from urllib.parse import urlparse, parse_qs
 import html
-from bs4 import BeautifulSoup
+import os
+import re
+from collections import Counter
+from typing import Dict, List, Optional
+
+import requests
 from googleapiclient.discovery import build
+from huggingface_hub import InferenceClient
+from openai import OpenAI
+from youtube_transcript_api import YouTubeTranscriptApi
+from youtube_transcript_api._errors import (
+    NoTranscriptFound,
+    RequestBlocked,
+    TranscriptsDisabled,
+    VideoUnavailable,
+)
+from youtube_transcript_api.proxies import GenericProxyConfig
+
+
+STOPWORDS = {
+    "the", "a", "an", "and", "or", "to", "of", "in", "on", "at", "for", "is",
+    "are", "was", "were", "be", "this", "that", "it", "with", "as", "by", "from",
+    "what", "who", "when", "where", "why", "how", "about", "does", "do", "did",
+}
+
 
 class RAGPipeline:
-    """
-    Cloud-compatible RAG Pipeline for YouTube Video Question Answering
-    Supports multiple LLM providers: Ollama (local), OpenRouter, HuggingFace
-    """
-    
-    def __init__(
-        self,
-        chunk_size: int = 1000,
-        chunk_overlap: int = 200,
-        retrieval_k: int = 3
-    ):
+    def __init__(self, chunk_size: int = 1200, retrieval_k: int = 4):
         self.chunk_size = chunk_size
-        self.chunk_overlap = chunk_overlap
         self.retrieval_k = retrieval_k
-        
-        # Cache: {video_id -> {"vectorstore": FAISS, "transcript": str}}
-        self.cache = {}
-        
-        # Initialize LLM and embeddings
-        self.embeddings = None
-        self.llm = None
+
+        # video_id -> {"transcript": str, "chunks": List[str], "ready": bool, "error": Optional[str]}
+        self.cache: Dict[str, Dict] = {}
+        self.processing_tasks: Dict[str, asyncio.Task] = {}
+
         self.youtube_api = None
-        self.llm_provider = os.getenv('LLM_PROVIDER', 'ollama')  # ollama, openrouter, huggingface
-        self.is_llm_configured = False
         self.is_youtube_api_configured = False
-        self._initialize_models()
-    
-    def _initialize_models(self):
-        """Initialize LLM based on provider selection"""
-        try:
-            # Initialize embeddings (always local)
-            self.embeddings = HuggingFaceEmbeddings(
-                model_name="sentence-transformers/all-MiniLM-L6-v2",
-                model_kwargs={'device': 'cpu'},
-                encode_kwargs={'normalize_embeddings': True}
+        self.llm_provider = os.getenv("LLM_PROVIDER", "openrouter").lower()
+        self.is_llm_configured = False
+
+        self.openrouter_client: Optional[OpenAI] = None
+        self.hf_client: Optional[InferenceClient] = None
+
+        self.request_timeout_seconds = int(os.getenv("CLOUD_REQUEST_TIMEOUT_SECONDS", "55"))
+        self._initialize_clients()
+
+    def _initialize_clients(self) -> None:
+        youtube_api_key = os.getenv("YOUTUBE_DATA_API_KEY")
+        if youtube_api_key:
+            self.youtube_api = build("youtube", "v3", developerKey=youtube_api_key)
+            self.is_youtube_api_configured = True
+            print("✓ YouTube Data API initialized")
+
+        if self.llm_provider == "openrouter":
+            api_key = os.getenv("OPENROUTER_API_KEY")
+            if not api_key:
+                raise ValueError("OPENROUTER_API_KEY is required when LLM_PROVIDER=openrouter")
+            self.openrouter_client = OpenAI(
+                api_key=api_key,
+                base_url="https://openrouter.ai/api/v1",
             )
-            print("✓ Embeddings model loaded")
-            
-            # Initialize LLM based on provider
-            if self.llm_provider == 'ollama':
-                self._init_ollama()
-            elif self.llm_provider == 'openrouter':
-                self._init_openrouter()
-            elif self.llm_provider == 'huggingface':
-                self._init_huggingface()
-            else:
-                print(f"⚠️  Unknown LLM provider: {self.llm_provider}, falling back to mock")
-                self.llm = self._create_mock_llm()
-                self.is_llm_configured = True
-                
-        except Exception as e:
-            print(f"❌ Error initializing models: {str(e)}")
-            self.is_llm_configured = False
-        
-        # Initialize YouTube Data API
-        try:
-            youtube_api_key = os.getenv('YOUTUBE_DATA_API_KEY')
-            if youtube_api_key:
-                self.youtube_api = build('youtube', 'v3', developerKey=youtube_api_key)
-                self.is_youtube_api_configured = True
-                print("✓ YouTube Data API initialized")
-        except Exception as e:
-            print(f"⚠️  YouTube Data API not configured: {e}")
+            self.is_llm_configured = True
+            print("✓ OpenRouter client initialized")
+            return
+
+        if self.llm_provider == "huggingface":
+            token = os.getenv("HUGGINGFACEHUB_API_TOKEN")
+            if not token:
+                raise ValueError("HUGGINGFACEHUB_API_TOKEN is required when LLM_PROVIDER=huggingface")
+            self.hf_client = InferenceClient(token=token)
+            self.is_llm_configured = True
+            print("✓ HuggingFace Inference client initialized")
+            return
+
+        raise ValueError("LLM_PROVIDER must be 'openrouter' or 'huggingface' in cloud mode")
 
     def _build_youtube_transcript_api(self) -> YouTubeTranscriptApi:
-        """
-        Build a YouTubeTranscriptApi instance that can route through a proxy.
-        Set either:
-          - `YT_TRANSCRIPT_PROXY_HTTP` / `YT_TRANSCRIPT_PROXY_HTTPS`, or
-          - `HTTP_PROXY` / `HTTPS_PROXY`
-        """
-        http_proxy = (
-            os.getenv("YT_TRANSCRIPT_PROXY_HTTP")
-            or os.getenv("HTTP_PROXY")
-            or os.getenv("http_proxy")
-        )
-        https_proxy = (
-            os.getenv("YT_TRANSCRIPT_PROXY_HTTPS")
-            or os.getenv("HTTPS_PROXY")
-            or os.getenv("https_proxy")
-        )
-
-        proxy_config = None
+        http_proxy = os.getenv("YT_TRANSCRIPT_PROXY_HTTP") or os.getenv("HTTP_PROXY") or os.getenv("http_proxy")
+        https_proxy = os.getenv("YT_TRANSCRIPT_PROXY_HTTPS") or os.getenv("HTTPS_PROXY") or os.getenv("https_proxy")
         if http_proxy or https_proxy:
-            proxy_config = GenericProxyConfig(http_url=http_proxy, https_url=https_proxy)
+            return YouTubeTranscriptApi(proxy_config=GenericProxyConfig(http_url=http_proxy, https_url=https_proxy))
+        return YouTubeTranscriptApi()
 
-        return YouTubeTranscriptApi(proxy_config=proxy_config)
+    async def ensure_video_processed(self, video_id: str, video_url: str) -> bool:
+        current = self.cache.get(video_id)
+        if current and current.get("ready"):
+            return True
 
-    def _get_requests_proxies(self) -> Optional[dict]:
-        """
-        Helper for explicit proxy routing for `requests` calls.
-        """
-        http_proxy = (
-            os.getenv("YT_TRANSCRIPT_PROXY_HTTP")
-            or os.getenv("HTTP_PROXY")
-            or os.getenv("http_proxy")
-        )
-        https_proxy = (
-            os.getenv("YT_TRANSCRIPT_PROXY_HTTPS")
-            or os.getenv("HTTPS_PROXY")
-            or os.getenv("https_proxy")
-        )
-        if not http_proxy and not https_proxy:
-            return None
-        return {"http": http_proxy or https_proxy, "https": https_proxy or http_proxy}
-    
-    def _init_ollama(self):
-        """Initialize Ollama (local) LLM"""
+        running = self.processing_tasks.get(video_id)
+        if running and not running.done():
+            return False
+
+        self.cache[video_id] = {"transcript": "", "chunks": [], "ready": False, "error": None}
+        self.processing_tasks[video_id] = asyncio.create_task(self._process_video(video_id, video_url))
+        return False
+
+    async def _process_video(self, video_id: str, video_url: str) -> None:
         try:
-            from langchain_ollama import OllamaLLM
-            model = os.getenv('OLLAMA_MODEL', 'llama3.2')
-            base_url = os.getenv('OLLAMA_BASE_URL', 'http://localhost:11434')
-            
-            self.llm = OllamaLLM(
-                model=model,
-                base_url=base_url,
-                temperature=0.7,
-                num_ctx=4096
-            )
-            # Test the LLM
-            self.llm.invoke("Hello")
-            self.is_llm_configured = True
-            print(f"✓ Ollama LLM ({model}) initialized")
-        except Exception as e:
-            print(f"⚠️  Ollama failed: {e}")
-            print("   Make sure Ollama is running or switch to cloud provider")
-            self.llm = self._create_mock_llm()
-            self.is_llm_configured = True
-    
-    def _init_openrouter(self):
-        """Initialize OpenRouter (cloud) LLM - FREE TIER AVAILABLE"""
-        try:
-            from langchain_openai import ChatOpenAI
-            api_key = os.getenv('OPENROUTER_API_KEY')
-            if not api_key:
-                raise ValueError("OPENROUTER_API_KEY not set")
-            
-            model = os.getenv('OPENROUTER_MODEL', 'meta-llama/llama-3.2-3b-instruct:free')
-            
-            self.llm = ChatOpenAI(
-                model=model,
-                openai_api_key=api_key,
-                openai_api_base="https://openrouter.ai/api/v1",
-                temperature=0.7,
-                max_tokens=512
-            )
-            # Test the LLM
-            self.llm.invoke("Hello")
-            self.is_llm_configured = True
-            print(f"✓ OpenRouter LLM ({model}) initialized")
-        except Exception as e:
-            print(f"⚠️  OpenRouter failed: {e}")
-            self.llm = self._create_mock_llm()
-            self.is_llm_configured = True
-    
-    def _init_huggingface(self):
-        """Initialize HuggingFace Inference API (cloud)"""
-        try:
-            from langchain_huggingface import HuggingFaceEndpoint
-            api_token = os.getenv('HUGGINGFACEHUB_API_TOKEN')
-            if not api_token:
-                raise ValueError("HUGGINGFACEHUB_API_TOKEN not set")
-            
-            self.llm = HuggingFaceEndpoint(
-                repo_id="google/flan-t5-large",
-                task="text-generation",
-                max_new_tokens=512,
-                temperature=0.7,
-                huggingfacehub_api_token=api_token,
-                timeout=60
-            )
-            self.llm.invoke("Hello")
-            self.is_llm_configured = True
-            print("✓ HuggingFace LLM initialized")
-        except Exception as e:
-            print(f"⚠️  HuggingFace failed: {e}")
-            self.llm = self._create_mock_llm()
-            self.is_llm_configured = True
-    
-    def _create_mock_llm(self):
-        """Create a mock LLM for testing/fallback"""
-        class MockLLM:
-            def invoke(self, prompt):
-                lines = prompt.split('\n')
-                question = ""
-                for line in lines:
-                    if line.startswith("Question:"):
-                        question = line.replace("Question:", "").strip()
-                        break
-                return f"Mock response for: {question}. Please configure a real LLM provider (Ollama, OpenRouter, or HuggingFace)."
-        return MockLLM()
-    
+            transcript = await asyncio.to_thread(self._fetch_transcript, video_id)
+            chunks = self._split_text(transcript)
+            self.cache[video_id] = {
+                "transcript": transcript,
+                "chunks": chunks,
+                "ready": True,
+                "error": None,
+            }
+            print(f"✓ Cached transcript for {video_id} ({len(chunks)} chunks)")
+        except Exception as exc:
+            self.cache[video_id] = {
+                "transcript": "",
+                "chunks": [],
+                "ready": False,
+                "error": str(exc),
+            }
+            print(f"❌ Transcript processing failed for {video_id}: {exc}")
+        finally:
+            self.processing_tasks.pop(video_id, None)
+
     async def answer_question(self, video_id: str, video_url: str, question: str) -> str:
-        """Answer a question about a YouTube video transcript"""
         if not self.is_llm_configured:
-            raise ValueError(f"LLM not configured. Set LLM_PROVIDER in .env (options: ollama, openrouter, huggingface)")
-        
-        # Check cache
-        if video_id not in self.cache:
-            print(f"📥 Processing video {video_id}...")
-            await self._process_video(video_id, video_url)
-        else:
-            print(f"✓ Using cached data for video {video_id}")
-        
-        # Retrieve relevant chunks
-        vectorstore = self.cache[video_id]["vectorstore"]
-        docs = vectorstore.similarity_search(question, k=self.retrieval_k)
-        
-        if not docs:
-            return "Sorry, I couldn't find relevant information in the video transcript."
-        
-        # Generate answer
-        answer = await self._generate_answer(question, docs)
-        return answer
-    
-    async def _process_video(self, video_id: str, video_url: str):
-        """Process a video: fetch transcript, chunk, embed, create vectorstore"""
-        loop = asyncio.get_event_loop()
-        
-        # Fetch transcript
-        print(f"  ⬇️  Fetching transcript...")
-        transcript_text = await loop.run_in_executor(None, self._fetch_transcript, video_id)
-        
-        # Split into chunks
-        print(f"  ✂️  Splitting into chunks...")
-        chunks = await loop.run_in_executor(None, self._split_text, transcript_text)
-        
-        if not chunks:
-            raise ValueError(f"No content found in transcript")
-        
-        # Create vectorstore
-        print(f"  🧠 Creating embeddings and vector store...")
-        vectorstore = await loop.run_in_executor(None, self._create_vectorstore, chunks)
-        
-        # Cache
-        self.cache[video_id] = {
-            "vectorstore": vectorstore,
-            "transcript": transcript_text,
-            "chunks": chunks
-        }
-        
-        print(f"✓ Video {video_id} processed: {len(chunks)} chunks cached")
-    
+            raise ValueError("LLM client is not configured")
+
+        entry = self.cache.get(video_id)
+        if not entry or not entry.get("ready"):
+            is_ready = await self.ensure_video_processed(video_id, video_url)
+            if not is_ready:
+                raise ValueError(
+                    "Video transcript is being prepared in background. Please retry in 10-20 seconds."
+                )
+
+        entry = self.cache.get(video_id) or {}
+        if entry.get("error"):
+            raise ValueError(f"Transcript preparation failed: {entry['error']}")
+
+        chunks = entry.get("chunks") or []
+        context_chunks = self._retrieve_relevant_chunks(question, chunks)
+        if not context_chunks:
+            return "I could not find enough transcript context to answer this question."
+
+        prompt = self._build_prompt(question, context_chunks)
+        return await asyncio.wait_for(
+            asyncio.to_thread(self._call_llm, prompt),
+            timeout=self.request_timeout_seconds,
+        )
+
     def _fetch_transcript(self, video_id: str) -> str:
-        """Fetch YouTube transcript with multiple fallback strategies"""
-        # Try YouTube Data API first
         if self.is_youtube_api_configured:
             try:
                 return self._fetch_transcript_youtube_data_api(video_id)
-            except Exception as e:
-                print(f"  ⚠️  YouTube Data API failed: {str(e)}")
-        
-        # Try youtube-transcript-api
-        try:
-            return self._fetch_transcript_youtube_api(video_id)
-        except Exception as e:
-            print(f"  ⚠️  YouTube API failed: {str(e)}")
-        
-        # Try web scraping
-        try:
-            return self._fetch_transcript_web_scraping(video_id)
-        except Exception as e:
-            print(f"  ⚠️  Web scraping failed: {str(e)}")
-        
-        raise ValueError(f"Unable to retrieve transcript for video {video_id}")
-    
-    def _fetch_transcript_youtube_data_api(self, video_id: str) -> str:
-        """Fetch using YouTube Data API"""
-        try:
-            video_response = self.youtube_api.videos().list(
-                part="snippet,contentDetails",
-                id=video_id,
-            ).execute()
+            except Exception as exc:
+                print(f"⚠️ YouTube Data API failed: {exc}")
 
-            if not video_response.get("items"):
-                raise ValueError(f"Video {video_id} not found")
-
-            video = video_response["items"][0]
-            print(f"  📹 Found video: {video['snippet'].get('title')}")
-
-            captions_response = self.youtube_api.captions().list(
-                part="snippet",
-                videoId=video_id,
-            ).execute()
-
-            items = captions_response.get("items") or []
-            if not items:
-                raise ValueError("No captions available for this video")
-
-            english_caption = None
-            for caption in items:
-                snippet = caption.get("snippet") or {}
-                if "en" in (snippet.get("language") or "").lower():
-                    english_caption = caption
-                    break
-
-            if not english_caption:
-                english_caption = items[0]
-                print(f"  ⚠️  Using {english_caption['snippet'].get('language')} captions (English not available)")
-
-            caption_download_url = english_caption["snippet"]["downloadUrl"]
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            }
-
-            proxies = self._get_requests_proxies()
-            response = requests.get(
-                caption_download_url,
-                headers=headers,
-                proxies=proxies,
-                timeout=30,
-            )
-            response.raise_for_status()
-
-            soup = BeautifulSoup(response.content, "xml")
-            text_elements = soup.find_all("text")
-            if not text_elements:
-                raise ValueError("No text content found in captions")
-
-            transcript_parts = []
-            for element in text_elements:
-                if element.text:
-                    text = html.unescape(element.text)
-                    text = re.sub(r"\s+", " ", text).strip()
-                    if text and text not in ["[Music]", "[Applause]"]:
-                        transcript_parts.append(text)
-
-            if not transcript_parts:
-                raise ValueError("No valid transcript content found")
-
-            transcript_text = " ".join(transcript_parts)
-            print(f"  ✓ YouTube Data API transcript fetched ({len(transcript_parts)} segments)")
-            return transcript_text
-
-        except Exception as e:
-            raise Exception(f"YouTube Data API method failed: {str(e)}")
-    
-    def _fetch_transcript_youtube_api(self, video_id: str) -> str:
-        """Fetch using youtube-transcript-api"""
         ytt = self._build_youtube_transcript_api()
-        
         language_combinations = [
             ("en", "en-US", "en-GB"),
             ("en",),
-            ("en-US",),
-            ("hi", "en"),
             ("es", "en"),
+            ("hi", "en"),
+            ("fr", "en"),
         ]
-        
         for languages in language_combinations:
             try:
                 fetched = ytt.fetch(video_id, languages=languages)
-                transcript_text = " ".join(s.text for s in fetched)
-                if transcript_text.strip():
-                    print(f"  ✓ Transcript fetched using languages: {languages}")
-                    return transcript_text
-            except (TranscriptsDisabled, NoTranscriptFound, VideoUnavailable):
+                text = " ".join(s.text for s in fetched).strip()
+                if text:
+                    return text
+            except (TranscriptsDisabled, NoTranscriptFound, VideoUnavailable, RequestBlocked):
                 continue
-            except Exception as e:
+            except Exception:
                 continue
-        
-        raise NoTranscriptFound(f"No transcript found for video {video_id}")
-    
-    def _fetch_transcript_web_scraping(self, video_id: str) -> str:
-        """Fetch using web scraping as fallback"""
-        import urllib.request
-        import json
-        
-        url = f"https://www.youtube.com/watch?v={video_id}"
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-        }
-        
-        req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=10) as response:
-            html_content = response.read().decode('utf-8')
-        
-        # Try to find caption tracks in the page
-        if '"captions":' in html_content:
-            try:
-                captions_json = json.loads(html_content.split('"captions":')[1].split(']')[0] + ']')
-                if captions_json and len(captions_json) > 0:
-                    caption_track = captions_json[0]
-                    if 'baseUrl' in caption_track:
-                        caption_url = caption_track['baseUrl']
-                        caption_req = urllib.request.Request(caption_url, headers=headers)
-                        with urllib.request.urlopen(caption_req, timeout=10) as response:
-                            caption_xml = response.read().decode('utf-8')
-                        
-                        # Parse XML to extract text
-                        import xml.etree.ElementTree as ET
-                        root = ET.fromstring(caption_xml)
-                        texts = [elem.text for elem in root.iter() if elem.text]
-                        return " ".join(texts)
-            except Exception as e:
-                print(f"Web scraping parse error: {e}")
-        
-        raise ValueError("Could not fetch transcript via web scraping")
-    
-    def _split_text(self, text: str) -> list:
-        """Split text into chunks"""
-        text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=self.chunk_size,
-            chunk_overlap=self.chunk_overlap,
-            length_function=len,
-            separators=["\n\n", "\n", ". ", " ", ""]
+        raise ValueError(f"Unable to fetch transcript for video {video_id}")
+
+    def _fetch_transcript_youtube_data_api(self, video_id: str) -> str:
+        captions_response = self.youtube_api.captions().list(part="snippet", videoId=video_id).execute()
+        items = captions_response.get("items") or []
+        if not items:
+            raise ValueError("No captions available")
+
+        selected = next((c for c in items if "en" in (c.get("snippet", {}).get("language", "").lower())), items[0])
+        caption_url = selected["snippet"]["downloadUrl"]
+
+        response = requests.get(caption_url, timeout=20)
+        response.raise_for_status()
+        text_elements = re.findall(r"<text[^>]*>(.*?)</text>", response.text, re.DOTALL)
+        cleaned = []
+        for t in text_elements:
+            val = re.sub(r"\s+", " ", html.unescape(t)).strip()
+            if val:
+                cleaned.append(val)
+        result = " ".join(cleaned).strip()
+        if not result:
+            raise ValueError("Caption download returned empty transcript")
+        return result
+
+    def _split_text(self, text: str) -> List[str]:
+        text = re.sub(r"\s+", " ", text).strip()
+        if not text:
+            return []
+        chunks: List[str] = []
+        start = 0
+        n = len(text)
+        while start < n:
+            end = min(start + self.chunk_size, n)
+            if end < n:
+                ws = text.rfind(" ", start, end)
+                if ws > start + int(self.chunk_size * 0.6):
+                    end = ws
+            chunks.append(text[start:end].strip())
+            start = end
+        return [c for c in chunks if c]
+
+    def _retrieve_relevant_chunks(self, question: str, chunks: List[str]) -> List[str]:
+        if not chunks:
+            return []
+        tokens = [
+            t for t in re.findall(r"[a-zA-Z0-9']+", question.lower())
+            if t not in STOPWORDS and len(t) > 2
+        ]
+        if not tokens:
+            return chunks[: self.retrieval_k]
+
+        scored = []
+        for idx, chunk in enumerate(chunks):
+            low = chunk.lower()
+            score = 0
+            counts = Counter(re.findall(r"[a-zA-Z0-9']+", low))
+            for token in tokens:
+                score += counts.get(token, 0)
+            if score > 0:
+                scored.append((score, idx, chunk))
+
+        if not scored:
+            return chunks[: self.retrieval_k]
+
+        scored.sort(key=lambda x: (-x[0], x[1]))
+        return [c for _, _, c in scored[: self.retrieval_k]]
+
+    def _build_prompt(self, question: str, context_chunks: List[str]) -> str:
+        context = "\n\n---\n\n".join(context_chunks)
+        return (
+            "You are an assistant answering questions about a YouTube video's transcript.\n"
+            "Answer ONLY from the provided transcript context.\n"
+            "If the answer is not in context, say you cannot find it in the transcript.\n"
+            "Keep response concise.\n\n"
+            f"Transcript Context:\n{context}\n\n"
+            f"Question: {question}\n\n"
+            "Answer:"
         )
-        return text_splitter.split_text(text)
-    
-    def _create_vectorstore(self, chunks: list) -> FAISS:
-        """Create FAISS vectorstore from chunks"""
-        return FAISS.from_texts(chunks, self.embeddings)
-    
-    async def _generate_answer(self, question: str, docs: list) -> str:
-        """Generate answer using LLM with retrieved context"""
-        context = "\n\n".join([doc.page_content for doc in docs])
-        
-        prompt_template = PromptTemplate(
-            input_variables=["context", "question"],
-            template="""Based on the following video transcript excerpts, please answer the question.
 
-Context from video transcript:
-{context}
-
-Question: {question}
-
-Please provide a concise, accurate answer based only on the context provided. If the context doesn't contain enough information to answer the question, say so.
-
-Answer:"""
-        )
-        
-        loop = asyncio.get_event_loop()
-        
-        try:
-            formatted_prompt = prompt_template.format(
-                context=context,
-                question=question
-            )
-            
-            response = await loop.run_in_executor(
-                None,
-                self._call_llm,
-                formatted_prompt
-            )
-            
-            return response
-            
-        except Exception as e:
-            print(f"❌ Error generating answer: {str(e)}")
-            raise ValueError(f"Error generating answer: {str(e)}")
-    
     def _call_llm(self, prompt: str) -> str:
-        """Call LLM and handle response"""
-        response = self.llm.invoke(prompt)
-        
-        # Handle different response types
-        if isinstance(response, str):
-            return response
-        elif hasattr(response, 'content'):
-            return response.content
-        else:
-            return str(response)
-    
+        if self.llm_provider == "openrouter":
+            model = os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.2-3b-instruct:free")
+            completion = self.openrouter_client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.2,
+                max_tokens=500,
+            )
+            return completion.choices[0].message.content.strip()
+
+        model = os.getenv("HUGGINGFACE_MODEL", "HuggingFaceH4/zephyr-7b-beta")
+        result = self.hf_client.text_generation(
+            prompt,
+            model=model,
+            max_new_tokens=400,
+            temperature=0.2,
+            do_sample=False,
+        )
+        return str(result).strip()
+
     def clear_cache(self, video_id: Optional[str] = None):
-        """Clear cache for specific video or all videos"""
         if video_id:
-            if video_id in self.cache:
-                del self.cache[video_id]
-                print(f"✓ Cache cleared for video {video_id}")
-        else:
-            self.cache.clear()
-            print("✓ All cache cleared")
+            self.cache.pop(video_id, None)
+            task = self.processing_tasks.pop(video_id, None)
+            if task and not task.done():
+                task.cancel()
+            return
+        for _, task in list(self.processing_tasks.items()):
+            if not task.done():
+                task.cancel()
+        self.processing_tasks.clear()
+        self.cache.clear()

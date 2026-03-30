@@ -39,6 +39,7 @@ pipeline_init_lock = None
 # Fallback to render.yaml values if env vars not set
 USE_CLOUD_PIPELINE = os.getenv('USE_CLOUD_PIPELINE', 'true').lower() == 'true'
 LLM_PROVIDER = os.getenv('LLM_PROVIDER', 'openrouter')
+ASK_TIMEOUT_SECONDS = int(os.getenv("ASK_TIMEOUT_SECONDS", "55"))
 
 # CRITICAL: Render assigns PORT via environment variable
 # MUST use os.environ.get() not os.getenv() for PORT
@@ -164,14 +165,25 @@ async def ask_question(request: AskRequest):
         raise HTTPException(status_code=400, detail="video_id and question are required")
     
     try:
-        answer = await rag_pipeline.answer_question(
-            video_id=request.video_id,
-            video_url=request.video_url,
-            question=request.question
+        answer = await asyncio.wait_for(
+            rag_pipeline.answer_question(
+                video_id=request.video_id,
+                video_url=request.video_url,
+                question=request.question
+            ),
+            timeout=ASK_TIMEOUT_SECONDS,
         )
         return AskResponse(answer=answer)
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            status_code=504,
+            detail="Request timed out while preparing transcript/answer. Please retry in a few seconds.",
+        )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        message = str(e)
+        if "being prepared in background" in message:
+            raise HTTPException(status_code=503, detail=message)
+        raise HTTPException(status_code=500, detail=message)
 
 @app.get("/status")
 async def get_status():
@@ -179,6 +191,7 @@ async def get_status():
     return {
         "status": "running" if rag_pipeline else "initializing",
         "cached_videos": len(rag_pipeline.cache) if rag_pipeline else 0,
+        "processing_videos": len(getattr(rag_pipeline, "processing_tasks", {})) if rag_pipeline else 0,
         "llm_provider": LLM_PROVIDER,
         "llm_configured": getattr(rag_pipeline, 'is_llm_configured', False) if rag_pipeline else False
     }

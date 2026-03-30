@@ -1,3 +1,13 @@
+fastapi
+uvicorn[standard]
+python-dotenv
+python-multipart
+youtube-transcript-api>=1.0.0
+requests
+pydantic
+openai
+huggingface_hub
+google-api-python-client
 # Cloud-compatible requirements
 fastapi
 uvicorn[standard]
