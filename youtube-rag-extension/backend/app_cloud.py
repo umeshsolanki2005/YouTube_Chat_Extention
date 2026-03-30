@@ -17,7 +17,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import os
 from dotenv import load_dotenv
-from contextlib import asynccontextmanager
 import asyncio
 
 # Load environment variables
@@ -32,6 +31,10 @@ print(f"   OPENROUTER_API_KEY: {'SET' if os.getenv('OPENROUTER_API_KEY') else 'N
 
 # Global variables - MUST use Render's PORT env var
 rag_pipeline = None
+# NOTE: Don't create asyncio primitives at import-time.
+# Render starts Python before the event loop exists; creating `asyncio.Lock()`
+# can crash the process and prevent binding to `PORT`.
+pipeline_init_lock = None
 
 # Fallback to render.yaml values if env vars not set
 USE_CLOUD_PIPELINE = os.getenv('USE_CLOUD_PIPELINE', 'true').lower() == 'true'
@@ -45,11 +48,11 @@ HOST = '0.0.0.0'  # Must bind to 0.0.0.0 for Render
 print(f"🚀 Config: HOST={HOST}, PORT={PORT}, LLM={LLM_PROVIDER}, CLOUD={USE_CLOUD_PIPELINE}")
 
 async def init_pipeline_async():
-    """Initialize RAG pipeline asynchronously"""
+    """Initialize RAG pipeline asynchronously (used for lazy init)."""
     global rag_pipeline
-    
+
     print("🔄 Starting RAG pipeline initialization...")
-    
+
     try:
         if USE_CLOUD_PIPELINE:
             from rag_pipeline_cloud import RAGPipeline
@@ -57,34 +60,33 @@ async def init_pipeline_async():
         else:
             from rag_pipeline import RAGPipeline
             print("💻 Using local RAG pipeline")
-        
-        # Run pipeline init in thread pool to not block
+
         loop = asyncio.get_event_loop()
         rag_pipeline = await loop.run_in_executor(None, RAGPipeline)
         print("✅ RAG pipeline ready!")
-        
     except Exception as e:
         print(f"❌ Pipeline init failed: {e}")
         import traceback
         traceback.print_exc()
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Lifespan context - server starts immediately"""
-    # Create background task for pipeline init
-    task = asyncio.create_task(init_pipeline_async())
-    yield
-    # Cancel task on shutdown if still running
-    if not task.done():
-        task.cancel()
-    print("🛑 Shutting down...")
+async def ensure_pipeline_initialized():
+    """Lazy init so the server binds ports immediately on Render."""
+    global rag_pipeline
+    global pipeline_init_lock
+    if rag_pipeline is not None:
+        return
+    if pipeline_init_lock is None:
+        pipeline_init_lock = asyncio.Lock()
 
-# Initialize FastAPI app with lifespan
+    async with pipeline_init_lock:
+        if rag_pipeline is not None:
+            return
+        await init_pipeline_async()
+
 app = FastAPI(
     title="YouTube RAG Chatbot Backend",
     description="Backend for YouTube Transcript RAG Chatbot",
-    version="2.0.0",
-    lifespan=lifespan
+    version="2.0.0"
 )
 
 app.add_middleware(
@@ -149,12 +151,14 @@ async def get_config():
 async def ask_question(request: AskRequest):
     """Answer question about video"""
     global rag_pipeline
-    
+
     if rag_pipeline is None:
-        raise HTTPException(
-            status_code=503, 
-            detail="Backend is still initializing. Please wait 30-60 seconds for models to load."
-        )
+        await ensure_pipeline_initialized()
+        if rag_pipeline is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Backend initialization failed. Check server logs."
+            )
     
     if not request.video_id or not request.question:
         raise HTTPException(status_code=400, detail="video_id and question are required")

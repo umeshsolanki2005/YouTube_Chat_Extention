@@ -22,6 +22,7 @@ if hasattr(sys.stdout, "reconfigure"):
 import os
 from typing import Optional
 from youtube_transcript_api import YouTubeTranscriptApi
+from youtube_transcript_api.proxies import GenericProxyConfig
 from youtube_transcript_api._errors import TranscriptsDisabled, NoTranscriptFound, VideoUnavailable, RequestBlocked, IpBlocked
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
@@ -77,6 +78,45 @@ class RAGPipeline:
         self.is_huggingface_configured = False
         self.is_youtube_api_configured = False
         self._initialize_models()
+    
+    def _build_youtube_transcript_api(self) -> YouTubeTranscriptApi:
+        """
+        Build a YouTubeTranscriptApi instance that can route through a proxy.
+        Set either:
+          - `YT_TRANSCRIPT_PROXY_HTTP` / `YT_TRANSCRIPT_PROXY_HTTPS`, or
+          - `HTTP_PROXY` / `HTTPS_PROXY`
+        """
+        http_proxy = (
+            os.getenv("YT_TRANSCRIPT_PROXY_HTTP")
+            or os.getenv("HTTP_PROXY")
+            or os.getenv("http_proxy")
+        )
+        https_proxy = (
+            os.getenv("YT_TRANSCRIPT_PROXY_HTTPS")
+            or os.getenv("HTTPS_PROXY")
+            or os.getenv("https_proxy")
+        )
+
+        proxy_config = None
+        if http_proxy or https_proxy:
+            proxy_config = GenericProxyConfig(http_url=http_proxy, https_url=https_proxy)
+
+        return YouTubeTranscriptApi(proxy_config=proxy_config)
+
+    def _get_requests_proxies(self) -> Optional[dict]:
+        http_proxy = (
+            os.getenv("YT_TRANSCRIPT_PROXY_HTTP")
+            or os.getenv("HTTP_PROXY")
+            or os.getenv("http_proxy")
+        )
+        https_proxy = (
+            os.getenv("YT_TRANSCRIPT_PROXY_HTTPS")
+            or os.getenv("HTTPS_PROXY")
+            or os.getenv("https_proxy")
+        )
+        if not http_proxy and not https_proxy:
+            return None
+        return {"http": http_proxy or https_proxy, "https": https_proxy or http_proxy}
     
     def _initialize_models(self):
         """Initialize Ollama local LLM and embeddings"""
@@ -306,7 +346,7 @@ class RAGPipeline:
     
     def _fetch_transcript_youtube_api(self, video_id: str) -> str:
         """Primary method using youtube-transcript-api"""
-        ytt = YouTubeTranscriptApi()
+        ytt = self._build_youtube_transcript_api()
         
         # Try multiple language combinations
         language_combinations = [
@@ -342,7 +382,7 @@ class RAGPipeline:
     
     def _fetch_transcript_auto_generated(self, video_id: str) -> str:
         """Try to fetch auto-generated captions"""
-        ytt = YouTubeTranscriptApi()
+        ytt = self._build_youtube_transcript_api()
         
         try:
             # Get list of available transcripts
@@ -458,7 +498,8 @@ class RAGPipeline:
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
             }
             
-            response = requests.get(caption_download_url, headers=headers)
+            proxies = self._get_requests_proxies()
+            response = requests.get(caption_download_url, headers=headers, proxies=proxies, timeout=30)
             response.raise_for_status()
             
             # Parse XML caption content
@@ -498,7 +539,8 @@ class RAGPipeline:
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
             }
             
-            response = requests.get(video_url, headers=headers)
+            proxies = self._get_requests_proxies()
+            response = requests.get(video_url, headers=headers, proxies=proxies, timeout=30)
             response.raise_for_status()
             
             # Parse HTML
@@ -541,7 +583,7 @@ class RAGPipeline:
                                 caption_url = caption.get('baseUrl')
                                 if caption_url:
                                     # Fetch caption content
-                                    caption_response = requests.get(caption_url, headers=headers)
+                                    caption_response = requests.get(caption_url, headers=headers, proxies=proxies, timeout=30)
                                     caption_response.raise_for_status()
                                     
                                     # Parse XML caption content
@@ -581,7 +623,8 @@ class RAGPipeline:
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
             }
             
-            response = requests.get(video_url, headers=headers)
+            proxies = self._get_requests_proxies()
+            response = requests.get(video_url, headers=headers, proxies=proxies, timeout=30)
             response.raise_for_status()
             
             # Extract ytInitialData from the page
@@ -604,7 +647,7 @@ class RAGPipeline:
                         caption_url = caption.get('baseUrl')
                         if caption_url:
                             # Fetch caption content
-                            caption_response = requests.get(caption_url, headers=headers)
+                            caption_response = requests.get(caption_url, headers=headers, proxies=proxies, timeout=30)
                             caption_response.raise_for_status()
                             
                             # Parse XML caption content
@@ -637,7 +680,7 @@ class RAGPipeline:
                                 if 'en' in caption.get('languageCode', '').lower():
                                     caption_url = caption.get('baseUrl')
                                     if caption_url:
-                                        caption_response = requests.get(caption_url, headers=headers)
+                                        caption_response = requests.get(caption_url, headers=headers, proxies=proxies, timeout=30)
                                         caption_response.raise_for_status()
                                         
                                         caption_soup = BeautifulSoup(caption_response.content, 'xml')

@@ -15,6 +15,7 @@ if hasattr(sys.stdout, "reconfigure"):
 import os
 from typing import Optional, Dict, Any
 from youtube_transcript_api import YouTubeTranscriptApi
+from youtube_transcript_api.proxies import GenericProxyConfig
 from youtube_transcript_api._errors import TranscriptsDisabled, NoTranscriptFound, VideoUnavailable, RequestBlocked, IpBlocked
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
@@ -95,6 +96,48 @@ class RAGPipeline:
                 print("✓ YouTube Data API initialized")
         except Exception as e:
             print(f"⚠️  YouTube Data API not configured: {e}")
+
+    def _build_youtube_transcript_api(self) -> YouTubeTranscriptApi:
+        """
+        Build a YouTubeTranscriptApi instance that can route through a proxy.
+        Set either:
+          - `YT_TRANSCRIPT_PROXY_HTTP` / `YT_TRANSCRIPT_PROXY_HTTPS`, or
+          - `HTTP_PROXY` / `HTTPS_PROXY`
+        """
+        http_proxy = (
+            os.getenv("YT_TRANSCRIPT_PROXY_HTTP")
+            or os.getenv("HTTP_PROXY")
+            or os.getenv("http_proxy")
+        )
+        https_proxy = (
+            os.getenv("YT_TRANSCRIPT_PROXY_HTTPS")
+            or os.getenv("HTTPS_PROXY")
+            or os.getenv("https_proxy")
+        )
+
+        proxy_config = None
+        if http_proxy or https_proxy:
+            proxy_config = GenericProxyConfig(http_url=http_proxy, https_url=https_proxy)
+
+        return YouTubeTranscriptApi(proxy_config=proxy_config)
+
+    def _get_requests_proxies(self) -> Optional[dict]:
+        """
+        Helper for explicit proxy routing for `requests` calls.
+        """
+        http_proxy = (
+            os.getenv("YT_TRANSCRIPT_PROXY_HTTP")
+            or os.getenv("HTTP_PROXY")
+            or os.getenv("http_proxy")
+        )
+        https_proxy = (
+            os.getenv("YT_TRANSCRIPT_PROXY_HTTPS")
+            or os.getenv("HTTPS_PROXY")
+            or os.getenv("https_proxy")
+        )
+        if not http_proxy and not https_proxy:
+            return None
+        return {"http": http_proxy or https_proxy, "https": https_proxy or http_proxy}
     
     def _init_ollama(self):
         """Initialize Ollama (local) LLM"""
@@ -258,13 +301,78 @@ class RAGPipeline:
     
     def _fetch_transcript_youtube_data_api(self, video_id: str) -> str:
         """Fetch using YouTube Data API"""
-        captions = self.youtube_api.captions().list(part='snippet', videoId=video_id).execute()
-        # Implementation would download caption track
-        raise NotImplementedError("Caption download requires additional implementation")
+        try:
+            video_response = self.youtube_api.videos().list(
+                part="snippet,contentDetails",
+                id=video_id,
+            ).execute()
+
+            if not video_response.get("items"):
+                raise ValueError(f"Video {video_id} not found")
+
+            video = video_response["items"][0]
+            print(f"  📹 Found video: {video['snippet'].get('title')}")
+
+            captions_response = self.youtube_api.captions().list(
+                part="snippet",
+                videoId=video_id,
+            ).execute()
+
+            items = captions_response.get("items") or []
+            if not items:
+                raise ValueError("No captions available for this video")
+
+            english_caption = None
+            for caption in items:
+                snippet = caption.get("snippet") or {}
+                if "en" in (snippet.get("language") or "").lower():
+                    english_caption = caption
+                    break
+
+            if not english_caption:
+                english_caption = items[0]
+                print(f"  ⚠️  Using {english_caption['snippet'].get('language')} captions (English not available)")
+
+            caption_download_url = english_caption["snippet"]["downloadUrl"]
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            }
+
+            proxies = self._get_requests_proxies()
+            response = requests.get(
+                caption_download_url,
+                headers=headers,
+                proxies=proxies,
+                timeout=30,
+            )
+            response.raise_for_status()
+
+            soup = BeautifulSoup(response.content, "xml")
+            text_elements = soup.find_all("text")
+            if not text_elements:
+                raise ValueError("No text content found in captions")
+
+            transcript_parts = []
+            for element in text_elements:
+                if element.text:
+                    text = html.unescape(element.text)
+                    text = re.sub(r"\s+", " ", text).strip()
+                    if text and text not in ["[Music]", "[Applause]"]:
+                        transcript_parts.append(text)
+
+            if not transcript_parts:
+                raise ValueError("No valid transcript content found")
+
+            transcript_text = " ".join(transcript_parts)
+            print(f"  ✓ YouTube Data API transcript fetched ({len(transcript_parts)} segments)")
+            return transcript_text
+
+        except Exception as e:
+            raise Exception(f"YouTube Data API method failed: {str(e)}")
     
     def _fetch_transcript_youtube_api(self, video_id: str) -> str:
         """Fetch using youtube-transcript-api"""
-        ytt = YouTubeTranscriptApi()
+        ytt = self._build_youtube_transcript_api()
         
         language_combinations = [
             ("en", "en-US", "en-GB"),
