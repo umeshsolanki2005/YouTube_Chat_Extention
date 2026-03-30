@@ -18,7 +18,6 @@ from collections import Counter
 from typing import Dict, List, Optional
 
 import requests
-from googleapiclient.discovery import build
 from huggingface_hub import InferenceClient
 from openai import OpenAI
 from youtube_transcript_api import YouTubeTranscriptApi
@@ -47,7 +46,6 @@ class RAGPipeline:
         self.cache: Dict[str, Dict] = {}
         self.processing_tasks: Dict[str, asyncio.Task] = {}
 
-        self.youtube_api = None
         self.is_youtube_api_configured = False
         self.llm_provider = os.getenv("LLM_PROVIDER", "openrouter").lower()
         self.is_llm_configured = False
@@ -60,12 +58,6 @@ class RAGPipeline:
         self._initialize_clients()
 
     def _initialize_clients(self) -> None:
-        youtube_api_key = os.getenv("YOUTUBE_DATA_API_KEY")
-        if youtube_api_key:
-            self.youtube_api = build("youtube", "v3", developerKey=youtube_api_key)
-            self.is_youtube_api_configured = True
-            print("[OK] YouTube Data API initialized")
-
         if self.llm_provider == "openrouter":
             api_key = os.getenv("OPENROUTER_API_KEY")
             if not api_key:
@@ -95,6 +87,14 @@ class RAGPipeline:
         if http_proxy or https_proxy:
             return YouTubeTranscriptApi(proxy_config=GenericProxyConfig(http_url=http_proxy, https_url=https_proxy))
         return YouTubeTranscriptApi()
+
+    def _youtube_headers(self) -> dict:
+        return {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+            )
+        }
 
     async def ensure_video_processed(self, video_id: str, video_url: str) -> bool:
         current = self.cache.get(video_id)
@@ -218,35 +218,28 @@ class RAGPipeline:
         except Exception as exc:
             print(f"[WARN] Web fallback failed: {exc}")
 
+        # Fallback path: youtubei player API caption tracks (no API key)
+        try:
+            return self._fetch_transcript_youtubei(video_id)
+        except Exception as exc:
+            print(f"[WARN] YouTubei fallback failed: {exc}")
+
         # Fallback path: direct timedtext endpoints
         try:
             return self._fetch_transcript_timedtext(video_id)
         except Exception as exc:
             print(f"[WARN] Timedtext fallback failed: {exc}")
 
-        # Optional diagnostic using YouTube Data API (doesn't attempt caption download)
-        if self.is_youtube_api_configured:
-            try:
-                self._fetch_transcript_youtube_data_api(video_id)
-            except Exception as exc:
-                print(f"[WARN] YouTube Data API info check failed: {exc}")
+        # Fallback path: yt-dlp subtitles/automatic captions (no API key)
+        try:
+            return self._fetch_transcript_ytdlp(video_id)
+        except Exception as exc:
+            print(f"[WARN] yt-dlp fallback failed: {exc}")
 
         raise ValueError(
             f"Unable to fetch transcript for video {video_id}. "
             "Captions may be unavailable/blocked for this request."
         )
-
-    def _fetch_transcript_youtube_data_api(self, video_id: str) -> str:
-        """
-        Diagnostic-only check.
-        NOTE: `captions().list(part='snippet')` does not provide `downloadUrl` in most cases.
-        """
-        captions_response = self.youtube_api.captions().list(part="snippet", videoId=video_id).execute()
-        items = captions_response.get("items") or []
-        if not items:
-            raise ValueError("No caption tracks found via YouTube Data API")
-        langs = [((x.get("snippet") or {}).get("language") or "?") for x in items]
-        raise ValueError(f"Caption tracks exist ({', '.join(langs)}), but direct download URL is not exposed")
 
     def _fetch_transcript_web_scraping(self, video_id: str) -> str:
         """
@@ -254,12 +247,7 @@ class RAGPipeline:
         This is lightweight and works without local models.
         """
         watch_url = f"https://www.youtube.com/watch?v={video_id}"
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-            )
-        }
+        headers = self._youtube_headers()
 
         page = requests.get(watch_url, headers=headers, timeout=20)
         page.raise_for_status()
@@ -296,6 +284,59 @@ class RAGPipeline:
         transcript = " ".join(cleaned).strip()
         if not transcript:
             raise ValueError("Timedtext XML was empty")
+        return transcript
+
+    def _fetch_transcript_youtubei(self, video_id: str) -> str:
+        """
+        Use YouTube internal player endpoint (no API key) to fetch caption tracks,
+        then download transcript XML from baseUrl.
+        """
+        url = "https://www.youtube.com/youtubei/v1/player?prettyPrint=false"
+        payload = {
+            "videoId": video_id,
+            "context": {
+                "client": {
+                    "clientName": "WEB",
+                    "clientVersion": "2.20250326.01.00",
+                    "hl": "en",
+                    "gl": "US",
+                }
+            },
+        }
+        resp = requests.post(url, json=payload, headers=self._youtube_headers(), timeout=20)
+        resp.raise_for_status()
+        data = resp.json()
+        tracks = (
+            data.get("captions", {})
+            .get("playerCaptionsTracklistRenderer", {})
+            .get("captionTracks", [])
+        )
+        if not tracks:
+            raise ValueError("No captionTracks in youtubei response")
+
+        track = None
+        for t in tracks:
+            if "en" in (t.get("languageCode", "").lower()):
+                track = t
+                break
+        if track is None:
+            track = tracks[0]
+
+        base_url = track.get("baseUrl")
+        if not base_url:
+            raise ValueError("youtubei track missing baseUrl")
+
+        xml_resp = requests.get(base_url, headers=self._youtube_headers(), timeout=20)
+        xml_resp.raise_for_status()
+        text_elements = re.findall(r"<text[^>]*>(.*?)</text>", xml_resp.text, flags=re.DOTALL)
+        cleaned = []
+        for t in text_elements:
+            val = re.sub(r"\s+", " ", html.unescape(t)).strip()
+            if val:
+                cleaned.append(val)
+        transcript = " ".join(cleaned).strip()
+        if not transcript:
+            raise ValueError("youtubei transcript XML empty")
         return transcript
 
     def _extract_caption_tracks_from_html(self, html_text: str) -> List[dict]:
@@ -385,6 +426,110 @@ class RAGPipeline:
                 return transcript
 
         raise ValueError("Timedtext tracks exist but transcript fetch returned empty content")
+
+    def _fetch_transcript_ytdlp(self, video_id: str) -> str:
+        """
+        Use yt-dlp metadata to find subtitle/caption URLs and fetch transcript text.
+        """
+        try:
+            from yt_dlp import YoutubeDL
+        except Exception as exc:
+            raise ValueError("yt-dlp is not installed") from exc
+
+        watch_url = f"https://www.youtube.com/watch?v={video_id}"
+        ydl_opts = {
+            "quiet": True,
+            "skip_download": True,
+            "no_warnings": True,
+            "socket_timeout": 20,
+        }
+        with YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(watch_url, download=False)
+
+        if not info:
+            raise ValueError("yt-dlp did not return video info")
+
+        subtitles = info.get("subtitles") or {}
+        auto_caps = info.get("automatic_captions") or {}
+
+        def pick_track(group: dict) -> Optional[dict]:
+            # Prefer English keys first
+            preferred_keys = []
+            for k in group.keys():
+                if str(k).lower().startswith("en"):
+                    preferred_keys.append(k)
+            preferred_keys += [k for k in group.keys() if k not in preferred_keys]
+
+            for key in preferred_keys:
+                tracks = group.get(key) or []
+                # Prefer vtt/json3 if available
+                ordered = sorted(tracks, key=lambda x: 0 if x.get("ext") in ("vtt", "json3") else 1)
+                for tr in ordered:
+                    if tr.get("url"):
+                        return tr
+            return None
+
+        track = pick_track(subtitles) or pick_track(auto_caps)
+        if not track:
+            raise ValueError("yt-dlp found no subtitle or auto-caption URL")
+
+        sub_resp = requests.get(track["url"], headers=self._youtube_headers(), timeout=20)
+        sub_resp.raise_for_status()
+        body = sub_resp.text
+
+        # VTT cleaning
+        if "WEBVTT" in body[:100]:
+            lines = []
+            for line in body.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                if line.startswith("WEBVTT"):
+                    continue
+                if re.match(r"^\d+$", line):
+                    continue
+                if "-->" in line:
+                    continue
+                # remove inline tags and cue settings
+                line = re.sub(r"<[^>]+>", "", line)
+                line = re.sub(r"\{[^}]+\}", "", line)
+                line = re.sub(r"\s+", " ", line).strip()
+                if line:
+                    lines.append(line)
+            transcript = " ".join(lines).strip()
+            if transcript:
+                return transcript
+
+        # JSON3 cleaning
+        if body.lstrip().startswith("{"):
+            try:
+                data = json.loads(body)
+                events = data.get("events") or []
+                chunks = []
+                for ev in events:
+                    segs = ev.get("segs") or []
+                    for s in segs:
+                        txt = (s.get("utf8") or "").strip()
+                        if txt:
+                            chunks.append(txt)
+                transcript = " ".join(chunks).strip()
+                if transcript:
+                    return transcript
+            except Exception:
+                pass
+
+        # Generic XML/text fallback
+        text_elements = re.findall(r"<text[^>]*>(.*?)</text>", body, flags=re.DOTALL)
+        cleaned = []
+        for t in text_elements:
+            val = re.sub(r"\s+", " ", html.unescape(t)).strip()
+            if val:
+                cleaned.append(val)
+        transcript = " ".join(cleaned).strip()
+        if transcript:
+            return transcript
+
+        raise ValueError("yt-dlp caption payload did not yield transcript text")
 
     def _split_text(self, text: str) -> List[str]:
         text = re.sub(r"\s+", " ", text).strip()
@@ -481,23 +626,49 @@ class RAGPipeline:
     async def _answer_from_video_metadata(self, video_id: str, question: str, transcript_error: Optional[str]) -> str:
         """
         Fallback path when transcript cannot be fetched.
-        Uses YouTube metadata so user still receives a useful answer.
+        Uses public metadata (oEmbed + watch page) so user still receives a useful answer.
         """
-        if not self.is_youtube_api_configured:
-            raise ValueError(
-                "Transcript unavailable and metadata fallback is not configured (YOUTUBE_DATA_API_KEY missing)."
-            )
-
         def _get_meta():
-            response = self.youtube_api.videos().list(part="snippet", id=video_id).execute()
-            items = response.get("items") or []
-            if not items:
+            watch_url = f"https://www.youtube.com/watch?v={video_id}"
+            title = ""
+            description = ""
+            channel = ""
+
+            # Try oEmbed first
+            try:
+                oembed = requests.get(
+                    "https://www.youtube.com/oembed",
+                    params={"url": watch_url, "format": "json"},
+                    headers=self._youtube_headers(),
+                    timeout=10,
+                )
+                if oembed.ok:
+                    j = oembed.json()
+                    title = j.get("title", "") or title
+                    channel = j.get("author_name", "") or channel
+            except Exception:
+                pass
+
+            # Fallback to watch page meta tags
+            try:
+                page = requests.get(watch_url, headers=self._youtube_headers(), timeout=15)
+                if page.ok:
+                    html_text = page.text
+                    m_title = re.search(r'<meta\s+name="title"\s+content="([^"]*)"', html_text)
+                    m_desc = re.search(r'<meta\s+name="description"\s+content="([^"]*)"', html_text)
+                    if m_title and not title:
+                        title = html.unescape(m_title.group(1))
+                    if m_desc:
+                        description = html.unescape(m_desc.group(1))
+            except Exception:
+                pass
+
+            if not title and not description and not channel:
                 return None
-            snippet = items[0].get("snippet", {})
             return {
-                "title": snippet.get("title", ""),
-                "description": snippet.get("description", ""),
-                "channel": snippet.get("channelTitle", ""),
+                "title": title,
+                "description": description,
+                "channel": channel,
             }
 
         meta = await asyncio.to_thread(_get_meta)

@@ -8,6 +8,7 @@ pydantic
 openai
 huggingface_hub
 google-api-python-client
+yt-dlp
 # Cloud-compatible requirements
 fastapi
 uvicorn[standard]
