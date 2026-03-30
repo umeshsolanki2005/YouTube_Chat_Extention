@@ -3,6 +3,7 @@ uvicorn[standard]
 python-dotenv
 python-multipart
 youtube-transcript-api>=1.0.0
+yt-dlp>=2024.1.0
 langchain
 langchain-core
 langchain-text-splitters

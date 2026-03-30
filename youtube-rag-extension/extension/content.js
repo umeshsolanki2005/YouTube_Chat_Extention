@@ -58,19 +58,25 @@ function notifyVideoInfo() {
     return;
   }
 
-  chrome.runtime.sendMessage(
-    {
-      type: 'UPDATE_VIDEO_INFO',
-      videoId,
-      videoUrl: window.location.href,
-      videoTitle,
-    },
-    (response) => {
-      if (chrome.runtime.lastError) {
-        console.error('[Content] Message error:', chrome.runtime.lastError.message);
+  try {
+    chrome.runtime.sendMessage(
+      {
+        type: 'UPDATE_VIDEO_INFO',
+        videoId,
+        videoUrl: window.location.href,
+        videoTitle,
+      },
+      (response) => {
+        if (chrome.runtime.lastError) {
+          console.warn('[Content] Message error (non-critical):', chrome.runtime.lastError.message);
+        }
       }
-    }
-  );
+    );
+  } catch (err) {
+    // Extension context invalidated - extension was reloaded
+    console.warn('[Content] Extension context invalidated, reloading...');
+    // Silently ignore - page will need refresh to reconnect
+  }
 }
 
 function scheduleNotify() {
@@ -84,7 +90,11 @@ function scheduleNotify() {
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.type === 'YT_FORCE_REFRESH') {
     scheduleNotify();
-    sendResponse({ ok: true });
+    try {
+      sendResponse({ ok: true });
+    } catch (err) {
+      // Extension context invalidated
+    }
   }
   return false;
 });
