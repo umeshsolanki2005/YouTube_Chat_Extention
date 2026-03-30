@@ -17,49 +17,69 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import os
 from dotenv import load_dotenv
+from contextlib import asynccontextmanager
 
 # Load environment variables
 load_dotenv()
 
-# Check which RAG pipeline to use
+# Global variables - initialized lazily
+rag_pipeline = None
+pipeline_loading = False
+
 USE_CLOUD_PIPELINE = os.getenv('USE_CLOUD_PIPELINE', 'false').lower() == 'true'
-
-if USE_CLOUD_PIPELINE:
-    from rag_pipeline_cloud import RAGPipeline
-    print("☁️  Using cloud-compatible RAG pipeline")
-else:
-    from rag_pipeline import RAGPipeline
-    print("💻 Using local RAG pipeline")
-
-# Get configuration
 LLM_PROVIDER = os.getenv('LLM_PROVIDER', 'ollama')
 PORT = int(os.getenv('PORT', 8000))
 HOST = os.getenv('HOST', '0.0.0.0')
 
-# Initialize FastAPI app
+def init_pipeline():
+    """Initialize RAG pipeline in background"""
+    global rag_pipeline, pipeline_loading
+    if pipeline_loading or rag_pipeline is not None:
+        return
+    
+    pipeline_loading = True
+    print("🔄 Initializing RAG pipeline...")
+    
+    try:
+        if USE_CLOUD_PIPELINE:
+            from rag_pipeline_cloud import RAGPipeline
+            print("☁️  Using cloud-compatible RAG pipeline")
+        else:
+            from rag_pipeline import RAGPipeline
+            print("💻 Using local RAG pipeline")
+        
+        rag_pipeline = RAGPipeline()
+        print("✅ RAG pipeline ready")
+    except Exception as e:
+        print(f"⚠️  Pipeline init error: {e}")
+    finally:
+        pipeline_loading = False
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Server starts first, then models load"""
+    import asyncio
+    # Start pipeline initialization in background
+    loop = asyncio.get_event_loop()
+    loop.run_in_executor(None, init_pipeline)
+    yield
+    print("🛑 Shutting down...")
+
+# Initialize FastAPI app with lifespan
 app = FastAPI(
     title="YouTube RAG Chatbot Backend",
-    description="Backend for YouTube Transcript RAG Chatbot Chrome Extension",
-    version="2.0.0"
+    description="Backend for YouTube Transcript RAG Chatbot",
+    version="2.0.0",
+    lifespan=lifespan
 )
-
-# CORS - Allow Chrome extension and deployed frontend
-ALLOWED_ORIGINS = os.getenv('ALLOWED_ORIGINS', '*').split(',')
-if '*' in ALLOWED_ORIGINS:
-    allow_origins = ["*"]
-else:
-    allow_origins = ALLOWED_ORIGINS
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allow_origins,
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# Initialize RAG pipeline
-rag_pipeline = RAGPipeline()
 
 # Request/Response models
 class AskRequest(BaseModel):
@@ -90,86 +110,59 @@ async def root():
         "config": "/config"
     }
 
-@app.get("/health", tags=["Health"])
+@app.get("/health")
 async def health_check():
-    """Health check endpoint"""
+    """Health check - responds immediately even during init"""
+    if rag_pipeline is None:
+        return {"status": "starting", "ready": False}
+    return {"status": "healthy", "ready": True, "llm_configured": getattr(rag_pipeline, 'is_llm_configured', False)}
+
+@app.get("/config")
+async def get_config():
+    """Get current configuration"""
     return {
-        "status": "healthy",
-        "message": "YouTube RAG Backend is running",
         "llm_provider": LLM_PROVIDER,
-        "llm_configured": rag_pipeline.is_llm_configured
+        "llm_configured": getattr(rag_pipeline, 'is_llm_configured', False) if rag_pipeline else False,
+        "youtube_api_configured": getattr(rag_pipeline, 'is_youtube_api_configured', False) if rag_pipeline else False,
+        "cached_videos": len(rag_pipeline.cache) if rag_pipeline else 0
     }
 
-@app.get("/config", response_model=ConfigResponse, tags=["Config"])
-async def get_config():
-    """Get current configuration (safe to expose)"""
-    return ConfigResponse(
-        llm_provider=LLM_PROVIDER,
-        llm_configured=rag_pipeline.is_llm_configured,
-        youtube_api_configured=rag_pipeline.is_youtube_api_configured,
-        cached_videos=len(rag_pipeline.cache)
-    )
-
-@app.post("/ask", response_model=AskResponse, tags=["RAG"])
-async def ask_question(request: AskRequest) -> AskResponse:
-    """Main endpoint: Answer a question about a YouTube video"""
+@app.post("/ask", response_model=AskResponse)
+async def ask_question(request: AskRequest):
+    """Answer question about video"""
+    global rag_pipeline
+    
+    if rag_pipeline is None:
+        raise HTTPException(status_code=503, detail="Backend initializing, please retry in 30 seconds")
+    
+    if not request.video_id or not request.question:
+        raise HTTPException(status_code=400, detail="video_id and question are required")
+    
     try:
-        # Validate inputs
-        if not request.video_id or not request.question:
-            raise HTTPException(
-                status_code=400,
-                detail="video_id and question are required"
-            )
-        
-        # Get answer from RAG pipeline
         answer = await rag_pipeline.answer_question(
             video_id=request.video_id,
             video_url=request.video_url,
             question=request.question
         )
-        
         return AskResponse(answer=answer)
-        
-    except HTTPException:
-        raise
     except Exception as e:
-        error_msg = str(e)
-        print(f"Error processing question: {error_msg}")
-        
-        # User-friendly error messages
-        if "Unable to retrieve transcript" in error_msg:
-            detail = f"Transcript Error: {error_msg}"
-        elif "LLM not configured" in error_msg:
-            detail = (
-                f"Configuration Error: {error_msg}\n\n"
-                f"Please set LLM_PROVIDER in environment variables. "
-                f"Options: ollama (local), openrouter (free cloud), huggingface"
-            )
-        elif "Error generating answer" in error_msg:
-            detail = f"AI Generation Error: {error_msg}"
-        else:
-            detail = f"Error: {error_msg}"
-        
-        raise HTTPException(
-            status_code=500,
-            detail=detail
-        )
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/status", tags=["Status"])
+@app.get("/status")
 async def get_status():
-    """Get current status including cache info"""
+    """Get current status"""
     return {
-        "status": "running",
-        "cached_videos": len(rag_pipeline.cache),
+        "status": "running" if rag_pipeline else "initializing",
+        "cached_videos": len(rag_pipeline.cache) if rag_pipeline else 0,
         "llm_provider": LLM_PROVIDER,
-        "llm_configured": rag_pipeline.is_llm_configured,
-        "youtube_api_configured": rag_pipeline.is_youtube_api_configured
+        "llm_configured": getattr(rag_pipeline, 'is_llm_configured', False) if rag_pipeline else False
     }
 
-@app.post("/clear-cache", tags=["Admin"])
+@app.post("/clear-cache")
 async def clear_cache(video_id: str = None):
-    """Clear cache (for maintenance)"""
-    rag_pipeline.clear_cache(video_id)
+    """Clear cache"""
+    if rag_pipeline:
+        rag_pipeline.clear_cache(video_id)
     return {"message": "Cache cleared", "video_id": video_id}
 
 if __name__ == "__main__":
