@@ -99,6 +99,9 @@ class RAGPipeline:
         current = self.cache.get(video_id)
         if current and current.get("ready"):
             return True
+        if current and current.get("error"):
+            # Keep the error state stable; don't re-queue forever on each request.
+            return False
 
         running = self.processing_tasks.get(video_id)
         if running and not running.done():
@@ -135,16 +138,20 @@ class RAGPipeline:
             raise ValueError("LLM client is not configured")
 
         entry = self.cache.get(video_id)
+        if entry and entry.get("error"):
+            return await self._answer_from_video_metadata(video_id, question, entry.get("error"))
+
         if not entry or not entry.get("ready"):
             is_ready = await self.ensure_video_processed(video_id, video_url)
             if not is_ready:
-                raise ValueError(
-                    "Video transcript is being prepared in background. Please retry in 10-20 seconds."
-                )
+                entry = self.cache.get(video_id)
+                if entry and entry.get("error"):
+                    return await self._answer_from_video_metadata(video_id, question, entry.get("error"))
+                raise ValueError("Video transcript is being prepared in background. Please retry in 10-20 seconds.")
 
         entry = self.cache.get(video_id) or {}
         if entry.get("error"):
-            raise ValueError(f"Transcript preparation failed: {entry['error']}")
+            return await self._answer_from_video_metadata(video_id, question, entry.get("error"))
 
         chunks = entry.get("chunks") or []
         context_chunks = self._retrieve_relevant_chunks(question, chunks)
@@ -447,6 +454,60 @@ class RAGPipeline:
             "Best transcript snippet:\n\n"
             f"{snippet}"
         )
+
+    async def _answer_from_video_metadata(self, video_id: str, question: str, transcript_error: Optional[str]) -> str:
+        """
+        Fallback path when transcript cannot be fetched.
+        Uses YouTube metadata so user still receives a useful answer.
+        """
+        if not self.is_youtube_api_configured:
+            raise ValueError(
+                "Transcript unavailable and metadata fallback is not configured (YOUTUBE_DATA_API_KEY missing)."
+            )
+
+        def _get_meta():
+            response = self.youtube_api.videos().list(part="snippet", id=video_id).execute()
+            items = response.get("items") or []
+            if not items:
+                return None
+            snippet = items[0].get("snippet", {})
+            return {
+                "title": snippet.get("title", ""),
+                "description": snippet.get("description", ""),
+                "channel": snippet.get("channelTitle", ""),
+            }
+
+        meta = await asyncio.to_thread(_get_meta)
+        if not meta:
+            raise ValueError(f"Transcript unavailable and video metadata not found for {video_id}.")
+
+        prompt = (
+            "Transcript is unavailable. Use ONLY this video metadata to answer the user's question.\n"
+            "Be explicit that this answer is metadata-based, not transcript-based.\n\n"
+            f"Video title: {meta['title']}\n"
+            f"Channel: {meta['channel']}\n"
+            f"Description: {meta['description'][:3000]}\n\n"
+            f"Question: {question}\n"
+            "Answer:"
+        )
+        try:
+            ans = await asyncio.wait_for(
+                asyncio.to_thread(self._call_llm, prompt),
+                timeout=self.request_timeout_seconds,
+            )
+            return (
+                "Transcript could not be fetched for this video, so this is a metadata-based answer:\n\n"
+                f"{ans}"
+            )
+        except Exception:
+            # deterministic fallback when provider is rate-limited
+            return (
+                "Transcript could not be fetched for this video. "
+                "Based on title/description, this video appears to be about:\n\n"
+                f"- {meta['title']}\n"
+                f"- Channel: {meta['channel']}\n"
+                f"- Description summary: {meta['description'][:400]}"
+            )
 
     def clear_cache(self, video_id: Optional[str] = None):
         if video_id:
