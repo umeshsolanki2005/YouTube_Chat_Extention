@@ -32,11 +32,14 @@ print(f"   OPENROUTER_API_KEY: {'SET' if os.getenv('OPENROUTER_API_KEY') else 'N
 
 # Global variables - MUST use Render's PORT env var
 rag_pipeline = None
-USE_CLOUD_PIPELINE = os.getenv('USE_CLOUD_PIPELINE', 'false').lower() == 'true'
-LLM_PROVIDER = os.getenv('LLM_PROVIDER', 'ollama')
+
+# Fallback to render.yaml values if env vars not set
+USE_CLOUD_PIPELINE = os.getenv('USE_CLOUD_PIPELINE', 'true').lower() == 'true'
+LLM_PROVIDER = os.getenv('LLM_PROVIDER', 'openrouter')
+
 # CRITICAL: Render assigns PORT via environment variable
 # MUST use os.environ.get() not os.getenv() for PORT
-PORT = int(os.environ.get('PORT', 8000))
+PORT = int(os.environ.get('PORT', 10000))
 HOST = '0.0.0.0'  # Must bind to 0.0.0.0 for Render
 
 print(f"🚀 Config: HOST={HOST}, PORT={PORT}, LLM={LLM_PROVIDER}, CLOUD={USE_CLOUD_PIPELINE}")
