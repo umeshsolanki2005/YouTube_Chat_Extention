@@ -13,6 +13,7 @@ import html
 import os
 import re
 import json
+import xml.etree.ElementTree as ET
 from collections import Counter
 from typing import Dict, List, Optional
 
@@ -62,7 +63,7 @@ class RAGPipeline:
         if youtube_api_key:
             self.youtube_api = build("youtube", "v3", developerKey=youtube_api_key)
             self.is_youtube_api_configured = True
-            print("✓ YouTube Data API initialized")
+            print("[OK] YouTube Data API initialized")
 
         if self.llm_provider == "openrouter":
             api_key = os.getenv("OPENROUTER_API_KEY")
@@ -73,7 +74,7 @@ class RAGPipeline:
                 base_url="https://openrouter.ai/api/v1",
             )
             self.is_llm_configured = True
-            print("✓ OpenRouter client initialized")
+            print("[OK] OpenRouter client initialized")
             return
 
         if self.llm_provider == "huggingface":
@@ -82,7 +83,7 @@ class RAGPipeline:
                 raise ValueError("HUGGINGFACEHUB_API_TOKEN is required when LLM_PROVIDER=huggingface")
             self.hf_client = InferenceClient(token=token)
             self.is_llm_configured = True
-            print("✓ HuggingFace Inference client initialized")
+            print("[OK] HuggingFace Inference client initialized")
             return
 
         raise ValueError("LLM_PROVIDER must be 'openrouter' or 'huggingface' in cloud mode")
@@ -117,7 +118,7 @@ class RAGPipeline:
                 "ready": True,
                 "error": None,
             }
-            print(f"✓ Cached transcript for {video_id} ({len(chunks)} chunks)")
+            print(f"[OK] Cached transcript for {video_id} ({len(chunks)} chunks)")
         except Exception as exc:
             self.cache[video_id] = {
                 "transcript": "",
@@ -125,7 +126,7 @@ class RAGPipeline:
                 "ready": False,
                 "error": str(exc),
             }
-            print(f"❌ Transcript processing failed for {video_id}: {exc}")
+            print(f"[ERR] Transcript processing failed for {video_id}: {exc}")
         finally:
             self.processing_tasks.pop(video_id, None)
 
@@ -151,10 +152,14 @@ class RAGPipeline:
             return "I could not find enough transcript context to answer this question."
 
         prompt = self._build_prompt(question, context_chunks)
-        return await asyncio.wait_for(
-            asyncio.to_thread(self._call_llm, prompt),
-            timeout=self.request_timeout_seconds,
-        )
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(self._call_llm, prompt),
+                timeout=self.request_timeout_seconds,
+            )
+        except Exception as exc:
+            # Cloud free-tier providers can rate limit; provide a useful fallback answer.
+            return self._extractive_fallback_answer(question, context_chunks, exc)
 
     def _fetch_transcript(self, video_id: str) -> str:
         # Primary path: youtube-transcript-api
@@ -181,14 +186,20 @@ class RAGPipeline:
         try:
             return self._fetch_transcript_web_scraping(video_id)
         except Exception as exc:
-            print(f"⚠️ Web fallback failed: {exc}")
+            print(f"[WARN] Web fallback failed: {exc}")
+
+        # Fallback path: direct timedtext endpoints
+        try:
+            return self._fetch_transcript_timedtext(video_id)
+        except Exception as exc:
+            print(f"[WARN] Timedtext fallback failed: {exc}")
 
         # Optional diagnostic using YouTube Data API (doesn't attempt caption download)
         if self.is_youtube_api_configured:
             try:
                 self._fetch_transcript_youtube_data_api(video_id)
             except Exception as exc:
-                print(f"⚠️ YouTube Data API info check failed: {exc}")
+                print(f"[WARN] YouTube Data API info check failed: {exc}")
 
         raise ValueError(
             f"Unable to fetch transcript for video {video_id}. "
@@ -224,11 +235,7 @@ class RAGPipeline:
         page.raise_for_status()
         html_text = page.text
 
-        m = re.search(r'"captionTracks":(\[.*?\])', html_text)
-        if not m:
-            raise ValueError("captionTracks not present on page")
-
-        tracks = json.loads(m.group(1))
+        tracks = self._extract_caption_tracks_from_html(html_text)
         if not tracks:
             raise ValueError("captionTracks list is empty")
 
@@ -260,6 +267,94 @@ class RAGPipeline:
         if not transcript:
             raise ValueError("Timedtext XML was empty")
         return transcript
+
+    def _extract_caption_tracks_from_html(self, html_text: str) -> List[dict]:
+        """
+        Extract caption tracks from ytInitialPlayerResponse.
+        More reliable than naive regex on 'captionTracks' array text.
+        """
+        patterns = [
+            r"ytInitialPlayerResponse\s*=\s*(\{.*?\});",
+            r'window\["ytInitialPlayerResponse"\]\s*=\s*(\{.*?\});',
+        ]
+
+        for pattern in patterns:
+            match = re.search(pattern, html_text, flags=re.DOTALL)
+            if not match:
+                continue
+            try:
+                payload = json.loads(match.group(1))
+                captions = payload.get("captions", {}).get("playerCaptionsTracklistRenderer", {})
+                tracks = captions.get("captionTracks") or []
+                if tracks:
+                    return tracks
+            except Exception:
+                continue
+        return []
+
+    def _fetch_transcript_timedtext(self, video_id: str) -> str:
+        """
+        Direct timedtext fallback:
+        1) get available tracks
+        2) request transcript XML by lang (and kind when present)
+        """
+        list_url = "https://www.youtube.com/api/timedtext"
+        list_resp = requests.get(
+            list_url,
+            params={"type": "list", "v": video_id},
+            timeout=20,
+        )
+        list_resp.raise_for_status()
+
+        xml_text = list_resp.text.strip()
+        if not xml_text:
+            raise ValueError("No timedtext track list returned")
+
+        try:
+            root = ET.fromstring(xml_text)
+        except ET.ParseError as exc:
+            raise ValueError(f"Timedtext list parse error: {exc}")
+
+        tracks = []
+        for track in root.findall("track"):
+            lang_code = track.attrib.get("lang_code")
+            kind = track.attrib.get("kind", "")
+            if lang_code:
+                tracks.append((lang_code, kind))
+
+        if not tracks:
+            raise ValueError("No track entries in timedtext list")
+
+        preferred = []
+        # Prefer English tracks first
+        for lang, kind in tracks:
+            if lang.lower().startswith("en"):
+                preferred.append((lang, kind))
+        for pair in tracks:
+            if pair not in preferred:
+                preferred.append(pair)
+
+        for lang, kind in preferred:
+            params = {"v": video_id, "lang": lang}
+            if kind:
+                params["kind"] = kind
+            resp = requests.get(list_url, params=params, timeout=20)
+            if resp.status_code != 200:
+                continue
+
+            body = resp.text
+            text_elements = re.findall(r"<text[^>]*>(.*?)</text>", body, flags=re.DOTALL)
+            cleaned = []
+            for t in text_elements:
+                val = re.sub(r"\s+", " ", html.unescape(t)).strip()
+                if val:
+                    cleaned.append(val)
+
+            transcript = " ".join(cleaned).strip()
+            if transcript:
+                return transcript
+
+        raise ValueError("Timedtext tracks exist but transcript fetch returned empty content")
 
     def _split_text(self, text: str) -> List[str]:
         text = re.sub(r"\s+", " ", text).strip()
@@ -336,6 +431,22 @@ class RAGPipeline:
             do_sample=False,
         )
         return str(result).strip()
+
+    def _extractive_fallback_answer(self, question: str, context_chunks: List[str], err: Exception) -> str:
+        """
+        Deterministic fallback when LLM provider fails/rate-limits.
+        Returns best-effort answer from transcript context so user isn't blocked.
+        """
+        best = context_chunks[0] if context_chunks else ""
+        # Keep output concise for extension UI.
+        snippet = best[:700].strip()
+        if not snippet:
+            return "Transcript is available, but AI generation is temporarily unavailable. Please retry in a moment."
+        return (
+            "AI provider is temporarily unavailable (rate-limited). "
+            "Best transcript snippet:\n\n"
+            f"{snippet}"
+        )
 
     def clear_cache(self, video_id: Optional[str] = None):
         if video_id:
