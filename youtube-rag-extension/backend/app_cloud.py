@@ -34,7 +34,8 @@ print(f"   OPENROUTER_API_KEY: {'SET' if os.getenv('OPENROUTER_API_KEY') else 'N
 rag_pipeline = None
 USE_CLOUD_PIPELINE = os.getenv('USE_CLOUD_PIPELINE', 'false').lower() == 'true'
 LLM_PROVIDER = os.getenv('LLM_PROVIDER', 'ollama')
-# Render assigns PORT - we MUST use it
+# CRITICAL: Render assigns PORT via environment variable
+# MUST use os.environ.get() not os.getenv() for PORT
 PORT = int(os.environ.get('PORT', 8000))
 HOST = '0.0.0.0'  # Must bind to 0.0.0.0 for Render
 
