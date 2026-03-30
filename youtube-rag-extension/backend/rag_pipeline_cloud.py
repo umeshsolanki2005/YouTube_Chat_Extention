@@ -56,6 +56,7 @@ class RAGPipeline:
         self.hf_client: Optional[InferenceClient] = None
 
         self.request_timeout_seconds = int(os.getenv("CLOUD_REQUEST_TIMEOUT_SECONDS", "55"))
+        self.transcript_timeout_seconds = int(os.getenv("TRANSCRIPT_TIMEOUT_SECONDS", "35"))
         self._initialize_clients()
 
     def _initialize_clients(self) -> None:
@@ -113,7 +114,10 @@ class RAGPipeline:
 
     async def _process_video(self, video_id: str, video_url: str) -> None:
         try:
-            transcript = await asyncio.to_thread(self._fetch_transcript, video_id)
+            transcript = await asyncio.wait_for(
+                asyncio.to_thread(self._fetch_transcript, video_id),
+                timeout=self.transcript_timeout_seconds,
+            )
             chunks = self._split_text(transcript)
             self.cache[video_id] = {
                 "transcript": transcript,
@@ -122,6 +126,14 @@ class RAGPipeline:
                 "error": None,
             }
             print(f"[OK] Cached transcript for {video_id} ({len(chunks)} chunks)")
+        except asyncio.TimeoutError:
+            self.cache[video_id] = {
+                "transcript": "",
+                "chunks": [],
+                "ready": False,
+                "error": f"Transcript fetch timed out after {self.transcript_timeout_seconds}s",
+            }
+            print(f"[ERR] Transcript processing timed out for {video_id}")
         except Exception as exc:
             self.cache[video_id] = {
                 "transcript": "",
@@ -144,10 +156,21 @@ class RAGPipeline:
         if not entry or not entry.get("ready"):
             is_ready = await self.ensure_video_processed(video_id, video_url)
             if not is_ready:
+                task = self.processing_tasks.get(video_id)
+                if task and not task.done():
+                    try:
+                        wait_budget = max(8, min(20, self.request_timeout_seconds - 10))
+                        await asyncio.wait_for(task, timeout=wait_budget)
+                    except asyncio.TimeoutError:
+                        pass
+
                 entry = self.cache.get(video_id)
                 if entry and entry.get("error"):
                     return await self._answer_from_video_metadata(video_id, question, entry.get("error"))
-                raise ValueError("Video transcript is being prepared in background. Please retry in 10-20 seconds.")
+                if entry and entry.get("ready"):
+                    pass
+                else:
+                    raise ValueError("Video transcript is being prepared in background. Please retry in 10-20 seconds.")
 
         entry = self.cache.get(video_id) or {}
         if entry.get("error"):
