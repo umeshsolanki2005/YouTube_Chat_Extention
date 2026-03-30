@@ -13,6 +13,8 @@
 const BACKEND_URL = 'https://youtube-rag-bot.onrender.com'; // Production
 
 const DEBOUNCE_DELAY = 1000;
+const HEALTH_TIMEOUT_MS = 8000;
+const ASK_TIMEOUT_MS = 45000;
 
 /** Last known result of GET /health — used so loading state and badges stay consistent */
 let backendReachable = false;
@@ -34,6 +36,16 @@ let currentVideoUrl = null;
 let isLoading = false;
 let lastRequestTime = 0;
 let chatHistory = [];
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = 30000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 function applyVideoPayload(payload) {
   if (payload?.videoId) {
@@ -119,7 +131,7 @@ setInterval(() => {
 // Check if backend is running
 async function checkBackendHealth() {
   try {
-    const response = await fetch(`${BACKEND_URL}/health`);
+    const response = await fetchWithTimeout(`${BACKEND_URL}/health`, {}, HEALTH_TIMEOUT_MS);
     if (response.ok) {
       backendReachable = true;
       if (!isLoading) {
@@ -179,8 +191,9 @@ async function handleAskWithRetry(maxRetries = 3, delay = 10000) {
         continue;
       }
       
-      // Final attempt failed or non-initializing error
-      throw error;
+      // Final attempt failed or non-initializing error:
+      // handleAsk already shows user-facing error, so avoid uncaught console noise.
+      return;
     }
   }
 }
@@ -216,7 +229,7 @@ async function handleAsk() {
     questionInputEl.value = '';
     
     // Call backend
-    const response = await fetch(`${BACKEND_URL}/ask`, {
+    const response = await fetchWithTimeout(`${BACKEND_URL}/ask`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -226,7 +239,7 @@ async function handleAsk() {
         video_url: currentVideoUrl,
         question: question
       })
-    });
+    }, ASK_TIMEOUT_MS);
     
     if (!response.ok) {
       const errorData = await response.json();
@@ -249,7 +262,10 @@ async function handleAsk() {
     // Handle specific error types
     if (error.message.includes('initializing') || error.message.includes('503')) {
       errorMsg = 'Backend is still starting up. Please wait 30 seconds and try again.';
-    } else if (error.message.includes('Failed to fetch')) {
+    } else if (error.name === 'AbortError') {
+      errorMsg = 'Request timed out while waiting for backend response. Render free instances can be slow to wake up. Please try again.';
+      backendReachable = false;
+    } else if (error.message.includes('Failed to fetch') || error.message.includes('ERR_CONNECTION_RESET')) {
       errorMsg = `Cannot connect to backend at ${BACKEND_URL}. Make sure the Python FastAPI server is running.`;
       backendReachable = false;
     } else if (error.message.includes('Transcript Error')) {
@@ -278,6 +294,9 @@ async function handleAsk() {
       chatHistory.pop();
       renderChatHistory();
     }
+
+    // Let retry wrapper decide whether to retry.
+    throw error;
   } finally {
     setLoading(false);
   }
