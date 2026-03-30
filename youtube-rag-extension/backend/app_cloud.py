@@ -18,27 +18,23 @@ from pydantic import BaseModel
 import os
 from dotenv import load_dotenv
 from contextlib import asynccontextmanager
+import asyncio
 
 # Load environment variables
 load_dotenv()
 
-# Global variables - initialized lazily
+# Global variables
 rag_pipeline = None
-pipeline_loading = False
-
 USE_CLOUD_PIPELINE = os.getenv('USE_CLOUD_PIPELINE', 'false').lower() == 'true'
 LLM_PROVIDER = os.getenv('LLM_PROVIDER', 'ollama')
 PORT = int(os.getenv('PORT', 8000))
 HOST = os.getenv('HOST', '0.0.0.0')
 
-def init_pipeline():
-    """Initialize RAG pipeline in background"""
-    global rag_pipeline, pipeline_loading
-    if pipeline_loading or rag_pipeline is not None:
-        return
+async def init_pipeline_async():
+    """Initialize RAG pipeline asynchronously"""
+    global rag_pipeline
     
-    pipeline_loading = True
-    print("🔄 Initializing RAG pipeline...")
+    print("🔄 Starting RAG pipeline initialization...")
     
     try:
         if USE_CLOUD_PIPELINE:
@@ -48,21 +44,25 @@ def init_pipeline():
             from rag_pipeline import RAGPipeline
             print("💻 Using local RAG pipeline")
         
-        rag_pipeline = RAGPipeline()
-        print("✅ RAG pipeline ready")
+        # Run pipeline init in thread pool to not block
+        loop = asyncio.get_event_loop()
+        rag_pipeline = await loop.run_in_executor(None, RAGPipeline)
+        print("✅ RAG pipeline ready!")
+        
     except Exception as e:
-        print(f"⚠️  Pipeline init error: {e}")
-    finally:
-        pipeline_loading = False
+        print(f"❌ Pipeline init failed: {e}")
+        import traceback
+        traceback.print_exc()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Server starts first, then models load"""
-    import asyncio
-    # Start pipeline initialization in background
-    loop = asyncio.get_event_loop()
-    loop.run_in_executor(None, init_pipeline)
+    """Lifespan context - server starts immediately"""
+    # Create background task for pipeline init
+    task = asyncio.create_task(init_pipeline_async())
     yield
+    # Cancel task on shutdown if still running
+    if not task.done():
+        task.cancel()
     print("🛑 Shutting down...")
 
 # Initialize FastAPI app with lifespan
@@ -112,10 +112,14 @@ async def root():
 
 @app.get("/health")
 async def health_check():
-    """Health check - responds immediately even during init"""
+    """Health check endpoint"""
     if rag_pipeline is None:
-        return {"status": "starting", "ready": False}
-    return {"status": "healthy", "ready": True, "llm_configured": getattr(rag_pipeline, 'is_llm_configured', False)}
+        return {"status": "starting", "ready": False, "message": "Backend initializing"}
+    return {
+        "status": "healthy", 
+        "ready": True, 
+        "llm_configured": getattr(rag_pipeline, 'is_llm_configured', False)
+    }
 
 @app.get("/config")
 async def get_config():
@@ -133,7 +137,10 @@ async def ask_question(request: AskRequest):
     global rag_pipeline
     
     if rag_pipeline is None:
-        raise HTTPException(status_code=503, detail="Backend initializing, please retry in 30 seconds")
+        raise HTTPException(
+            status_code=503, 
+            detail="Backend is still initializing. Please wait 30-60 seconds for models to load."
+        )
     
     if not request.video_id or not request.question:
         raise HTTPException(status_code=400, detail="video_id and question are required")
