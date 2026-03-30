@@ -5,7 +5,7 @@ services:
     name: youtube-rag-bot
     runtime: python
     plan: free
-    buildCommand: cd youtube-rag-extension/backend && pip install -r requirements.txt
+    buildCommand: cd youtube-rag-extension/backend && pip install --timeout 120 --retries 5 -r requirements.txt
     startCommand: cd youtube-rag-extension/backend && python app_cloud.py
     envVars:
       - key: PYTHON_VERSION
