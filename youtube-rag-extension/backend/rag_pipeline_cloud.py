@@ -12,6 +12,7 @@ import asyncio
 import html
 import os
 import re
+import json
 from collections import Counter
 from typing import Dict, List, Optional
 
@@ -156,12 +157,7 @@ class RAGPipeline:
         )
 
     def _fetch_transcript(self, video_id: str) -> str:
-        if self.is_youtube_api_configured:
-            try:
-                return self._fetch_transcript_youtube_data_api(video_id)
-            except Exception as exc:
-                print(f"⚠️ YouTube Data API failed: {exc}")
-
+        # Primary path: youtube-transcript-api
         ytt = self._build_youtube_transcript_api()
         language_combinations = [
             ("en", "en-US", "en-GB"),
@@ -180,29 +176,90 @@ class RAGPipeline:
                 continue
             except Exception:
                 continue
-        raise ValueError(f"Unable to fetch transcript for video {video_id}")
+
+        # Fallback path: parse caption tracks from watch page HTML
+        try:
+            return self._fetch_transcript_web_scraping(video_id)
+        except Exception as exc:
+            print(f"⚠️ Web fallback failed: {exc}")
+
+        # Optional diagnostic using YouTube Data API (doesn't attempt caption download)
+        if self.is_youtube_api_configured:
+            try:
+                self._fetch_transcript_youtube_data_api(video_id)
+            except Exception as exc:
+                print(f"⚠️ YouTube Data API info check failed: {exc}")
+
+        raise ValueError(
+            f"Unable to fetch transcript for video {video_id}. "
+            "Captions may be unavailable/blocked for this request."
+        )
 
     def _fetch_transcript_youtube_data_api(self, video_id: str) -> str:
+        """
+        Diagnostic-only check.
+        NOTE: `captions().list(part='snippet')` does not provide `downloadUrl` in most cases.
+        """
         captions_response = self.youtube_api.captions().list(part="snippet", videoId=video_id).execute()
         items = captions_response.get("items") or []
         if not items:
-            raise ValueError("No captions available")
+            raise ValueError("No caption tracks found via YouTube Data API")
+        langs = [((x.get("snippet") or {}).get("language") or "?") for x in items]
+        raise ValueError(f"Caption tracks exist ({', '.join(langs)}), but direct download URL is not exposed")
 
-        selected = next((c for c in items if "en" in (c.get("snippet", {}).get("language", "").lower())), items[0])
-        caption_url = selected["snippet"]["downloadUrl"]
+    def _fetch_transcript_web_scraping(self, video_id: str) -> str:
+        """
+        Parse caption track URLs from watch page HTML and fetch timedtext XML.
+        This is lightweight and works without local models.
+        """
+        watch_url = f"https://www.youtube.com/watch?v={video_id}"
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+            )
+        }
 
-        response = requests.get(caption_url, timeout=20)
-        response.raise_for_status()
-        text_elements = re.findall(r"<text[^>]*>(.*?)</text>", response.text, re.DOTALL)
+        page = requests.get(watch_url, headers=headers, timeout=20)
+        page.raise_for_status()
+        html_text = page.text
+
+        m = re.search(r'"captionTracks":(\[.*?\])', html_text)
+        if not m:
+            raise ValueError("captionTracks not present on page")
+
+        tracks = json.loads(m.group(1))
+        if not tracks:
+            raise ValueError("captionTracks list is empty")
+
+        # prefer English, else first available
+        track = None
+        for t in tracks:
+            if "en" in (t.get("languageCode", "").lower()):
+                track = t
+                break
+        if track is None:
+            track = tracks[0]
+
+        base_url = track.get("baseUrl")
+        if not base_url:
+            raise ValueError("No baseUrl in selected caption track")
+
+        xml_resp = requests.get(base_url, headers=headers, timeout=20)
+        xml_resp.raise_for_status()
+        xml_text = xml_resp.text
+
+        text_elements = re.findall(r"<text[^>]*>(.*?)</text>", xml_text, flags=re.DOTALL)
         cleaned = []
         for t in text_elements:
             val = re.sub(r"\s+", " ", html.unescape(t)).strip()
             if val:
                 cleaned.append(val)
-        result = " ".join(cleaned).strip()
-        if not result:
-            raise ValueError("Caption download returned empty transcript")
-        return result
+
+        transcript = " ".join(cleaned).strip()
+        if not transcript:
+            raise ValueError("Timedtext XML was empty")
+        return transcript
 
     def _split_text(self, text: str) -> List[str]:
         text = re.sub(r"\s+", " ", text).strip()
