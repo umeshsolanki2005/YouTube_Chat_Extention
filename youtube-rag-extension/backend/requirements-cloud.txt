@@ -1,3 +1,4 @@
+# Cloud-compatible requirements
 fastapi
 uvicorn[standard]
 python-dotenv
@@ -9,7 +10,6 @@ langchain-text-splitters
 langchain-community
 langchain-huggingface
 langchain-ollama
-langchain-openai
 huggingface_hub
 faiss-cpu
 requests
@@ -17,3 +17,6 @@ pydantic
 beautifulsoup4
 google-api-python-client
 sentence-transformers
+
+# Cloud LLM providers (optional - install based on need)
+langchain-openai  # For OpenRouter

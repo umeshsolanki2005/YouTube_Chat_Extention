@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>YouTube RAG Settings</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      max-width: 600px;
+      margin: 50px auto;
+      padding: 20px;
+      background: #f5f5f5;
+    }
+    .container {
+      background: white;
+      padding: 30px;
+      border-radius: 12px;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+    }
+    h1 {
+      color: #ff0000;
+      margin-bottom: 10px;
+    }
+    .subtitle {
+      color: #666;
+      margin-bottom: 30px;
+    }
+    .form-group {
+      margin-bottom: 20px;
+    }
+    label {
+      display: block;
+      font-weight: 600;
+      margin-bottom: 8px;
+      color: #333;
+    }
+    input[type="text"] {
+      width: 100%;
+      padding: 12px;
+      border: 2px solid #ddd;
+      border-radius: 8px;
+      font-size: 14px;
+      box-sizing: border-box;
+    }
+    input[type="text"]:focus {
+      outline: none;
+      border-color: #ff0000;
+    }
+    .help-text {
+      font-size: 12px;
+      color: #666;
+      margin-top: 5px;
+    }
+    button {
+      background: #ff0000;
+      color: white;
+      border: none;
+      padding: 12px 24px;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 16px;
+      font-weight: 600;
+    }
+    button:hover {
+      background: #cc0000;
+    }
+    .status {
+      margin-top: 20px;
+      padding: 12px;
+      border-radius: 8px;
+      display: none;
+    }
+    .status.success {
+      background: #d4edda;
+      color: #155724;
+      border: 1px solid #c3e6cb;
+      display: block;
+    }
+    .status.error {
+      background: #f8d7da;
+      color: #721c24;
+      border: 1px solid #f5c6cb;
+      display: block;
+    }
+    .mode-section {
+      margin-bottom: 25px;
+      padding: 15px;
+      background: #f8f9fa;
+      border-radius: 8px;
+    }
+    .mode-title {
+      font-weight: 600;
+      color: #333;
+      margin-bottom: 10px;
+    }
+    .mode-option {
+      margin: 10px 0;
+      padding: 10px;
+      cursor: pointer;
+      border-radius: 6px;
+      transition: background 0.2s;
+    }
+    .mode-option:hover {
+      background: #e9ecef;
+    }
+    .mode-option input {
+      margin-right: 10px;
+    }
+    .mode-option label {
+      cursor: pointer;
+      display: inline;
+    }
+    .recommended {
+      background: #d4edda;
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-size: 12px;
+      color: #155724;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>⚙️ YouTube RAG Settings</h1>
+    <p class="subtitle">Configure your backend connection</p>
+
+    <div class="mode-section">
+      <div class="mode-title">Select Mode:</div>
+      
+      <div class="mode-option">
+        <input type="radio" name="mode" id="mode-local" value="local" checked>
+        <label for="mode-local">
+          <strong>Local Mode</strong> - Backend runs on your computer
+          <div class="help-text">URL: http://localhost:8000</div>
+        </label>
+      </div>
+      
+      <div class="mode-option">
+        <input type="radio" name="mode" id="mode-cloud" value="cloud">
+        <label for="mode-cloud">
+          <strong>Cloud Mode</strong> - Use deployed backend <span class="recommended">RECOMMENDED</span>
+          <div class="help-text">Free hosting on Render, Railway, etc.</div>
+        </label>
+      </div>
+    </div>
+
+    <div class="form-group" id="cloud-url-group" style="display: none;">
+      <label for="backendUrl">Cloud Backend URL:</label>
+      <input type="text" id="backendUrl" placeholder="https://your-app.onrender.com">
+      <div class="help-text">
+        Enter your deployed backend URL (e.g., https://youtube-rag.onrender.com)
+      </div>
+    </div>
+
+    <button id="saveBtn">Save Settings</button>
+    
+    <div id="status" class="status"></div>
+
+    <div style="margin-top: 30px; padding-top: 20px; border-top: 1px solid #ddd;">
+      <h3>📖 Deployment Guide</h3>
+      <p>Don't have a cloud backend yet? <a href="https://github.com/umeshsolanki2005/YouTube_Chat_Extention/blob/main/DEPLOYMENT_GUIDE.md" target="_blank">View deployment guide</a></p>
+      <p style="font-size: 12px; color: #666;">
+        <strong>Quick Deploy:</strong> Use Render or Railway for free hosting. 
+        Get OpenRouter API key for free LLM access.
+      </p>
+    </div>
+  </div>
+
+  <script>
+    const modeLocal = document.getElementById('mode-local');
+    const modeCloud = document.getElementById('mode-cloud');
+    const cloudUrlGroup = document.getElementById('cloud-url-group');
+    const backendUrlInput = document.getElementById('backendUrl');
+    const saveBtn = document.getElementById('saveBtn');
+    const status = document.getElementById('status');
+
+    // Toggle URL input based on mode
+    function toggleMode() {
+      if (modeCloud.checked) {
+        cloudUrlGroup.style.display = 'block';
+      } else {
+        cloudUrlGroup.style.display = 'none';
+      }
+    }
+
+    modeLocal.addEventListener('change', toggleMode);
+    modeCloud.addEventListener('change', toggleMode);
+
+    // Load saved settings
+    chrome.storage.sync.get(['backendUrl', 'mode'], (result) => {
+      if (result.backendUrl) {
+        backendUrlInput.value = result.backendUrl;
+      }
+      if (result.mode === 'cloud') {
+        modeCloud.checked = true;
+        toggleMode();
+      }
+    });
+
+    // Save settings
+    saveBtn.addEventListener('click', () => {
+      const mode = modeCloud.checked ? 'cloud' : 'local';
+      const backendUrl = mode === 'cloud' ? backendUrlInput.value.trim() : 'http://localhost:8000';
+
+      if (mode === 'cloud' && !backendUrl) {
+        showStatus('Please enter a backend URL for cloud mode', 'error');
+        return;
+      }
+
+      chrome.storage.sync.set({
+        backendUrl: backendUrl,
+        mode: mode
+      }, () => {
+        showStatus(`Settings saved! Using ${mode === 'cloud' ? 'cloud' : 'local'} backend.`, 'success');
+      });
+    });
+
+    function showStatus(message, type) {
+      status.textContent = message;
+      status.className = `status ${type}`;
+      setTimeout(() => {
+        status.className = 'status';
+      }, 3000);
+    }
+  </script>
+</body>
+</html>

@@ -1,0 +1,24 @@
+# YouTube RAG Chatbot - Deployment Configuration
+
+# Python version
+python_version=3.11
+
+# Build command (optional)
+build_command=""
+
+# Start command
+start_command="cd backend && python app_cloud.py"
+
+# Environment variables (set these in Render dashboard)
+# LLM_PROVIDER=openrouter
+# OPENROUTER_API_KEY=your_key_here
+# OPENROUTER_MODEL=meta-llama/llama-3.2-3b-instruct:free
+# YOUTUBE_DATA_API_KEY=your_youtube_key_here
+# USE_CLOUD_PIPELINE=true
+# ALLOWED_ORIGINS=chrome-extension://*,https://www.youtube.com
+
+# Health check path
+health_check_path=/health
+
+# Port
+port=8000

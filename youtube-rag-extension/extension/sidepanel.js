@@ -3,13 +3,22 @@
  * Handles:
  * - Displaying current video info
  * - User input for questions
- * - Communication with Python backend
+ * - Communication with Python backend (local or cloud)
  * - Chat history display
  * - Loading and error states
  */
 
-const BACKEND_URL = 'http://localhost:8000';
+// Default backend URL (can be overridden via extension storage)
+let BACKEND_URL = 'http://localhost:8000';
 const DEBOUNCE_DELAY = 1000;
+
+// Load backend URL from storage (for cloud deployment)
+chrome.storage.sync.get(['backendUrl'], (result) => {
+  if (result.backendUrl) {
+    BACKEND_URL = result.backendUrl;
+    console.log('[SidePanel] Using backend URL:', BACKEND_URL);
+  }
+});
 
 /** Last known result of GET /health — used so loading state and badges stay consistent */
 let backendReachable = false;
