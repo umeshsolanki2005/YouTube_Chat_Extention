@@ -3,22 +3,16 @@
  * Handles:
  * - Displaying current video info
  * - User input for questions
- * - Communication with Python backend (local or cloud)
+ * - Communication with deployed backend
  * - Chat history display
  * - Loading and error states
  */
 
-// Default backend URL (can be overridden via extension storage)
-let BACKEND_URL = 'http://localhost:8000';
-const DEBOUNCE_DELAY = 1000;
+// Backend URL - Update this after deploying to Render
+// const BACKEND_URL = 'http://localhost:8000'; // Local development
+const BACKEND_URL = 'https://youtube-rag-bot.onrender.com'; // Production
 
-// Load backend URL from storage (for cloud deployment)
-chrome.storage.sync.get(['backendUrl'], (result) => {
-  if (result.backendUrl) {
-    BACKEND_URL = result.backendUrl;
-    console.log('[SidePanel] Using backend URL:', BACKEND_URL);
-  }
-});
+const DEBOUNCE_DELAY = 1000;
 
 /** Last known result of GET /health — used so loading state and badges stay consistent */
 let backendReachable = false;
