@@ -153,16 +153,37 @@ async function checkBackendHealth() {
   }
 }
 
-// Ask button click handler
-askButtonEl.addEventListener('click', handleAsk);
+// Ask button click handler with auto-retry for initializing backend
+askButtonEl.addEventListener('click', () => handleAskWithRetry());
 
-// Enter key support (Shift+Enter for new line, Enter to submit)
+// Enter key support
 questionInputEl.addEventListener('keydown', (event) => {
   if (event.key === 'Enter' && !event.shiftKey) {
     event.preventDefault();
-    handleAsk();
+    handleAskWithRetry();
   }
 });
+
+// Retry wrapper for handleAsk
+async function handleAskWithRetry(maxRetries = 3, delay = 10000) {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      await handleAsk();
+      return; // Success, exit
+    } catch (error) {
+      const isInitializing = error.message.includes('initializing') || error.message.includes('503');
+      
+      if (isInitializing && attempt < maxRetries) {
+        showError(`Backend initializing... Retrying in ${delay/1000} seconds (attempt ${attempt}/${maxRetries})`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+        continue;
+      }
+      
+      // Final attempt failed or non-initializing error
+      throw error;
+    }
+  }
+}
 
 // Debounced ask function
 async function handleAsk() {
@@ -209,7 +230,8 @@ async function handleAsk() {
     
     if (!response.ok) {
       const errorData = await response.json();
-      throw new Error(errorData.detail || `Backend error: ${response.status}`);
+      const errorMsg = errorData.detail || `Backend error: ${response.status}`;
+      throw new Error(errorMsg);
     }
     
     const data = await response.json();
@@ -224,8 +246,10 @@ async function handleAsk() {
     
     let errorMsg = error.message;
     
-    // Handle specific error types with better user messages
-    if (error.message.includes('Failed to fetch')) {
+    // Handle specific error types
+    if (error.message.includes('initializing') || error.message.includes('503')) {
+      errorMsg = 'Backend is still starting up. Please wait 30 seconds and try again.';
+    } else if (error.message.includes('Failed to fetch')) {
       errorMsg = `Cannot connect to backend at ${BACKEND_URL}. Make sure the Python FastAPI server is running.`;
       backendReachable = false;
     } else if (error.message.includes('Transcript Error')) {
