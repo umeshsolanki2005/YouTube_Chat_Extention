@@ -129,6 +129,20 @@ class RAGPipeline:
             )
         }
 
+    def _external_transcript_api_url(self) -> str:
+        return os.getenv("EXTERNAL_TRANSCRIPT_API_URL", "https://youtube-transcript-api-tau-one.vercel.app/transcript")
+
+    def _looks_like_valid_transcript(self, text: str) -> bool:
+        candidate = (text or "").strip()
+        if len(candidate) < 40:
+            return False
+        if candidate.startswith("0:{") and "1:null" in candidate:
+            return False
+        if candidate.count("{") > 3 and candidate.count("}") > 3:
+            return False
+        word_like = re.findall(r"[A-Za-z]{2,}", candidate)
+        return len(word_like) >= 8
+
     def _http_get(self, url: str, **kwargs):
         headers = kwargs.pop("headers", None) or self._youtube_headers()
         timeout = kwargs.pop("timeout", 20)
@@ -280,6 +294,12 @@ class RAGPipeline:
             except Exception:
                 continue
 
+        # Fallback path: external hosted transcript API
+        try:
+            return self._fetch_transcript_external_api(video_id)
+        except Exception as exc:
+            print(f"[WARN] External transcript API fallback failed: {exc}")
+
         # Fallback path: parse caption tracks from watch page HTML
         try:
             return self._fetch_transcript_web_scraping(video_id)
@@ -332,6 +352,38 @@ class RAGPipeline:
             raise NoTranscriptFound(f"No transcript found for video {video_id}")
         print(f"[OK] Transcript fetched using youtube-transcript-api instance: {languages}")
         return text
+
+    def _fetch_transcript_external_api(self, video_id: str) -> str:
+        watch_url = f"https://www.youtube.com/watch?v={video_id}"
+        endpoint = self._external_transcript_api_url()
+        payloads = [
+            {"url": watch_url},
+            {"video_url": watch_url},
+        ]
+
+        last_error = None
+        for payload in payloads:
+            try:
+                resp = self._http_post(
+                    endpoint,
+                    json=payload,
+                    headers={"Content-Type": "application/json"},
+                    timeout=20,
+                )
+                if resp.status_code == 429:
+                    raise ValueError("external transcript API rate-limited (429)")
+                resp.raise_for_status()
+                data = resp.json()
+                transcript = (data.get("transcript") or "").strip()
+                if not self._looks_like_valid_transcript(transcript):
+                    raise ValueError("external transcript API returned invalid transcript content")
+                print("[OK] Transcript fetched using external transcript API")
+                return transcript
+            except Exception as exc:
+                last_error = exc
+                continue
+
+        raise ValueError(str(last_error) if last_error else "external transcript API failed")
 
     def _fetch_transcript_web_scraping(self, video_id: str) -> str:
         """

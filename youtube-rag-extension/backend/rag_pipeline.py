@@ -129,6 +129,20 @@ class RAGPipeline:
         if not http_proxy and not https_proxy:
             return None
         return {"http": http_proxy or https_proxy, "https": https_proxy or http_proxy}
+
+    def _external_transcript_api_url(self) -> str:
+        return os.getenv("EXTERNAL_TRANSCRIPT_API_URL", "https://youtube-transcript-api-tau-one.vercel.app/transcript")
+
+    def _looks_like_valid_transcript(self, text: str) -> bool:
+        candidate = (text or "").strip()
+        if len(candidate) < 40:
+            return False
+        if candidate.startswith("0:{") and "1:null" in candidate:
+            return False
+        if candidate.count("{") > 3 and candidate.count("}") > 3:
+            return False
+        word_like = re.findall(r"[A-Za-z]{2,}", candidate)
+        return len(word_like) >= 8
     
     def _initialize_models(self):
         """Initialize Ollama local LLM and embeddings"""
@@ -347,7 +361,13 @@ class RAGPipeline:
         except Exception as e:
             print(f"  ⚠️  Auto-generated captions failed: {str(e)}")
         
-        # Strategy 3: Web scraping method
+        # Strategy 3: External hosted transcript API
+        try:
+            return self._fetch_transcript_external_api(video_id)
+        except Exception as e:
+            print(f"  External transcript API failed: {str(e)}")
+
+        # Strategy 4: Web scraping method
         try:
             return self._fetch_transcript_web_scraping(video_id)
         except Exception as e:
@@ -425,6 +445,39 @@ class RAGPipeline:
                 continue
         
         raise NoTranscriptFound(f"No transcript found for video {video_id}")
+
+    def _fetch_transcript_external_api(self, video_id: str) -> str:
+        watch_url = f"https://www.youtube.com/watch?v={video_id}"
+        endpoint = self._external_transcript_api_url()
+        payloads = [
+            {"url": watch_url},
+            {"video_url": watch_url},
+        ]
+
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        }
+        proxies = self._get_requests_proxies()
+        last_error = None
+
+        for payload in payloads:
+            try:
+                response = requests.post(endpoint, json=payload, headers=headers, proxies=proxies, timeout=20)
+                if response.status_code == 429:
+                    raise ValueError("external transcript API rate-limited (429)")
+                response.raise_for_status()
+                data = response.json()
+                transcript = (data.get("transcript") or "").strip()
+                if not self._looks_like_valid_transcript(transcript):
+                    raise ValueError("external transcript API returned invalid transcript content")
+                print("  ✓ Transcript fetched using external transcript API")
+                return transcript
+            except Exception as exc:
+                last_error = exc
+                continue
+
+        raise ValueError(str(last_error) if last_error else "external transcript API failed")
     
     def _fetch_transcript_auto_generated(self, video_id: str) -> str:
         """Try to fetch auto-generated captions"""
