@@ -94,6 +94,18 @@ class RAGPipeline:
             return YouTubeTranscriptApi(proxy_config=GenericProxyConfig(http_url=http_proxy, https_url=https_proxy))
         return YouTubeTranscriptApi()
 
+    def _join_transcript_segments(self, fetched) -> str:
+        parts = []
+        for segment in fetched:
+            if isinstance(segment, dict):
+                text = segment.get("text", "")
+            else:
+                text = getattr(segment, "text", "")
+            text = str(text).strip()
+            if text:
+                parts.append(text)
+        return " ".join(parts).strip()
+
     def _configured_proxies(self) -> Optional[dict]:
         http_proxy = os.getenv("YT_TRANSCRIPT_PROXY_HTTP")
         https_proxy = os.getenv("YT_TRANSCRIPT_PROXY_HTTPS")
@@ -246,7 +258,6 @@ class RAGPipeline:
 
     def _fetch_transcript(self, video_id: str) -> str:
         # Primary path: youtube-transcript-api
-        ytt = self._build_youtube_transcript_api()
         language_combinations = [
             ("en", "en-US", "en-GB"),
             ("en",),
@@ -256,8 +267,7 @@ class RAGPipeline:
         ]
         for languages in language_combinations:
             try:
-                fetched = ytt.fetch(video_id, languages=languages)
-                text = " ".join(s.text for s in fetched).strip()
+                text = self._fetch_transcript_youtube_api(video_id, list(languages))
                 if text:
                     return text
             except (TranscriptsDisabled, NoTranscriptFound, VideoUnavailable, RequestBlocked):
@@ -293,6 +303,30 @@ class RAGPipeline:
             f"Unable to fetch transcript for video {video_id}. "
             "Captions may be unavailable/blocked for this request."
         )
+
+    def _fetch_transcript_youtube_api(self, video_id: str, languages: Optional[List[str]] = None) -> str:
+        languages = languages or ["en"]
+
+        # User-requested simple path for older youtube-transcript-api versions.
+        get_transcript = getattr(YouTubeTranscriptApi, "get_transcript", None)
+        if callable(get_transcript):
+            try:
+                fetched = get_transcript(video_id, languages=languages)
+                text = self._join_transcript_segments(fetched)
+                if text:
+                    print(f"[OK] Transcript fetched using YouTubeTranscriptApi.get_transcript: {languages}")
+                    return text
+            except Exception:
+                pass
+
+        # Compatibility with newer youtube-transcript-api versions.
+        ytt = self._build_youtube_transcript_api()
+        fetched = ytt.fetch(video_id, languages=tuple(languages))
+        text = self._join_transcript_segments(fetched)
+        if not text:
+            raise NoTranscriptFound(f"No transcript found for video {video_id}")
+        print(f"[OK] Transcript fetched using youtube-transcript-api instance: {languages}")
+        return text
 
     def _fetch_transcript_web_scraping(self, video_id: str) -> str:
         """

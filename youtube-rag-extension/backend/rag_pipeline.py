@@ -103,6 +103,18 @@ class RAGPipeline:
 
         return YouTubeTranscriptApi(proxy_config=proxy_config)
 
+    def _join_transcript_segments(self, fetched) -> str:
+        parts = []
+        for segment in fetched:
+            if isinstance(segment, dict):
+                text = segment.get("text", "")
+            else:
+                text = getattr(segment, "text", "")
+            text = str(text).strip()
+            if text:
+                parts.append(text)
+        return " ".join(parts).strip()
+
     def _get_requests_proxies(self) -> Optional[dict]:
         http_proxy = (
             os.getenv("YT_TRANSCRIPT_PROXY_HTTP")
@@ -368,8 +380,6 @@ class RAGPipeline:
     
     def _fetch_transcript_youtube_api(self, video_id: str) -> str:
         """Primary method using youtube-transcript-api"""
-        ytt = self._build_youtube_transcript_api()
-        
         # Try multiple language combinations
         language_combinations = [
             ("en", "en-US", "en-GB"),  # English variants
@@ -386,8 +396,22 @@ class RAGPipeline:
         
         for languages in language_combinations:
             try:
+                transcript_text = ""
+                get_transcript = getattr(YouTubeTranscriptApi, "get_transcript", None)
+
+                if callable(get_transcript):
+                    try:
+                        fetched = get_transcript(video_id, languages=list(languages))
+                        transcript_text = self._join_transcript_segments(fetched)
+                        if transcript_text.strip():
+                            print(f"  ✓ Transcript fetched using YouTubeTranscriptApi.get_transcript: {languages}")
+                            return transcript_text
+                    except Exception:
+                        transcript_text = ""
+
+                ytt = self._build_youtube_transcript_api()
                 fetched = ytt.fetch(video_id, languages=languages)
-                transcript_text = " ".join(s.text for s in fetched)
+                transcript_text = self._join_transcript_segments(fetched)
                 
                 if transcript_text.strip():
                     print(f"  ✓ Transcript fetched using languages: {languages}")
@@ -395,9 +419,9 @@ class RAGPipeline:
                     
             except (TranscriptsDisabled, NoTranscriptFound, VideoUnavailable):
                 continue
-            except (RequestBlocked, IpBlocked) as e:
-                raise e  # Re-raise IP blocking errors
-            except Exception as e:
+            except (RequestBlocked, IpBlocked):
+                raise
+            except Exception:
                 continue
         
         raise NoTranscriptFound(f"No transcript found for video {video_id}")
