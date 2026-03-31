@@ -18,6 +18,7 @@ from pydantic import BaseModel
 import os
 from dotenv import load_dotenv
 import asyncio
+from typing import Optional
 
 # Load environment variables
 load_dotenv()
@@ -62,8 +63,7 @@ async def init_pipeline_async():
             from rag_pipeline import RAGPipeline
             print("💻 Using local RAG pipeline")
 
-        loop = asyncio.get_event_loop()
-        rag_pipeline = await loop.run_in_executor(None, RAGPipeline)
+        rag_pipeline = await asyncio.to_thread(RAGPipeline)
         print("✅ RAG pipeline ready!")
     except Exception as e:
         print(f"❌ Pipeline init failed: {e}")
@@ -104,6 +104,7 @@ class AskRequest(BaseModel):
     video_id: str
     video_url: str
     question: str
+    transcript: Optional[str] = None
 
 class AskResponse(BaseModel):
     """Response body for /ask endpoint"""
@@ -169,7 +170,8 @@ async def ask_question(request: AskRequest):
             rag_pipeline.answer_question(
                 video_id=request.video_id,
                 video_url=request.video_url,
-                question=request.question
+                question=request.question,
+                transcript=request.transcript,
             ),
             timeout=ASK_TIMEOUT_SECONDS,
         )

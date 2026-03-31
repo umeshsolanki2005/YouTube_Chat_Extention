@@ -177,9 +177,30 @@ class RAGPipeline:
         finally:
             self.processing_tasks.pop(video_id, None)
 
-    async def answer_question(self, video_id: str, video_url: str, question: str) -> str:
+    def _cache_transcript(self, video_id: str, transcript: str) -> None:
+        chunks = self._split_text(transcript)
+        if not chunks:
+            raise ValueError("Provided transcript was empty after cleaning")
+        self.cache[video_id] = {
+            "transcript": transcript,
+            "chunks": chunks,
+            "ready": True,
+            "error": None,
+        }
+        print(f"[OK] Cached provided transcript for {video_id} ({len(chunks)} chunks)")
+
+    async def answer_question(
+        self,
+        video_id: str,
+        video_url: str,
+        question: str,
+        transcript: Optional[str] = None,
+    ) -> str:
         if not self.is_llm_configured:
             raise ValueError("LLM client is not configured")
+
+        if transcript and transcript.strip():
+            self._cache_transcript(video_id, transcript.strip())
 
         entry = self.cache.get(video_id)
         if entry and entry.get("error"):

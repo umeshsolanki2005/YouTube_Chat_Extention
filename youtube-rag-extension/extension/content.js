@@ -3,6 +3,11 @@
  * Detects current YouTube video and notifies the service worker (per-tab storage).
  */
 
+let transcriptCache = {
+  videoId: null,
+  transcript: null,
+};
+
 function getVideoIdFromUrl(url) {
   try {
     const urlObj = new URL(url);
@@ -87,14 +92,169 @@ function scheduleNotify() {
   }, 120);
 }
 
+function extractJsonArrayByMarker(text, marker) {
+  const markerIndex = text.indexOf(marker);
+  if (markerIndex === -1) return null;
+
+  const arrayStart = text.indexOf('[', markerIndex + marker.length);
+  if (arrayStart === -1) return null;
+
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+
+  for (let i = arrayStart; i < text.length; i += 1) {
+    const ch = text[i];
+
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (ch === '\\') {
+        escaped = true;
+      } else if (ch === '"') {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (ch === '"') {
+      inString = true;
+      continue;
+    }
+
+    if (ch === '[') {
+      depth += 1;
+      continue;
+    }
+
+    if (ch === ']') {
+      depth -= 1;
+      if (depth === 0) {
+        return text.slice(arrayStart, i + 1);
+      }
+    }
+  }
+
+  return null;
+}
+
+function extractCaptionTracksFromDocument() {
+  const scripts = Array.from(document.scripts || []);
+  const markers = [
+    '"captionTracks":',
+    '"captionTracks" :',
+  ];
+
+  for (const script of scripts) {
+    const text = script.textContent || '';
+    if (!text.includes('captionTracks')) continue;
+
+    for (const marker of markers) {
+      const jsonArray = extractJsonArrayByMarker(text, marker);
+      if (!jsonArray) continue;
+
+      try {
+        const tracks = JSON.parse(jsonArray);
+        if (Array.isArray(tracks) && tracks.length > 0) {
+          return tracks;
+        }
+      } catch (error) {
+        // Keep scanning other scripts.
+      }
+    }
+  }
+
+  return [];
+}
+
+function pickCaptionTrack(tracks) {
+  if (!Array.isArray(tracks) || tracks.length === 0) return null;
+
+  const english = tracks.find((track) =>
+    String(track.languageCode || '').toLowerCase().startsWith('en')
+  );
+  return english || tracks[0] || null;
+}
+
+function decodeTranscriptXml(xmlText) {
+  const matches = xmlText.match(/<text[^>]*>([\s\S]*?)<\/text>/g) || [];
+  const parser = new DOMParser();
+  const cleaned = [];
+
+  for (const match of matches) {
+    const doc = parser.parseFromString(match, 'text/xml');
+    const text = doc.documentElement?.textContent || '';
+    const value = text.replace(/\s+/g, ' ').trim();
+    if (value) cleaned.push(value);
+  }
+
+  return cleaned.join(' ').trim();
+}
+
+async function fetchTranscriptFromCaptionTrack(track) {
+  if (!track?.baseUrl) {
+    throw new Error('caption track missing baseUrl');
+  }
+
+  const response = await fetch(track.baseUrl, {
+    method: 'GET',
+    credentials: 'include',
+  });
+  if (!response.ok) {
+    throw new Error(`caption request failed with ${response.status}`);
+  }
+
+  const body = await response.text();
+  const transcript = decodeTranscriptXml(body);
+  if (!transcript) {
+    throw new Error('caption payload was empty');
+  }
+
+  return transcript;
+}
+
+async function fetchTranscriptForCurrentVideo() {
+  const videoId = getVideoIdFromUrl(window.location.href);
+  if (!videoId) {
+    throw new Error('no video id');
+  }
+
+  if (transcriptCache.videoId === videoId && transcriptCache.transcript) {
+    return transcriptCache.transcript;
+  }
+
+  const tracks = extractCaptionTracksFromDocument();
+  const selectedTrack = pickCaptionTrack(tracks);
+  if (!selectedTrack) {
+    throw new Error('no caption tracks found on page');
+  }
+
+  const transcript = await fetchTranscriptFromCaptionTrack(selectedTrack);
+  transcriptCache = { videoId, transcript };
+  return transcript;
+}
+
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.type === 'YT_FORCE_REFRESH') {
+    transcriptCache = { videoId: null, transcript: null };
     scheduleNotify();
     try {
       sendResponse({ ok: true });
     } catch (err) {
       // Extension context invalidated
     }
+    return false;
+  }
+
+  if (msg.type === 'YT_GET_TRANSCRIPT') {
+    fetchTranscriptForCurrentVideo()
+      .then((transcript) => {
+        sendResponse({ ok: true, transcript });
+      })
+      .catch((error) => {
+        sendResponse({ ok: false, error: String(error?.message || error) });
+      });
+    return true;
   }
   return false;
 });
@@ -105,6 +265,7 @@ const urlCheckInterval = setInterval(() => {
   const href = window.location.href;
   if (href !== lastUrl) {
     lastUrl = href;
+    transcriptCache = { videoId: null, transcript: null };
     scheduleNotify();
   }
 }, 400);

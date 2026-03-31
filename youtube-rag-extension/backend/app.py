@@ -23,6 +23,7 @@ from pydantic import BaseModel
 import os
 from dotenv import load_dotenv
 from rag_pipeline import RAGPipeline
+from typing import Optional
 
 # Load environment variables
 load_dotenv()
@@ -53,6 +54,7 @@ class AskRequest(BaseModel):
     video_id: str
     video_url: str
     question: str
+    transcript: Optional[str] = None
 
 class AskResponse(BaseModel):
     """Response body for /ask endpoint"""
@@ -103,7 +105,8 @@ async def ask_question(request: AskRequest) -> AskResponse:
         answer = await rag_pipeline.answer_question(
             video_id=request.video_id,
             video_url=request.video_url,
-            question=request.question
+            question=request.question,
+            transcript=request.transcript,
         )
         
         return AskResponse(answer=answer)

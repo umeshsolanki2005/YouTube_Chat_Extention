@@ -185,7 +185,8 @@ class RAGPipeline:
         self,
         video_id: str,
         video_url: str,
-        question: str
+        question: str,
+        transcript: Optional[str] = None,
     ) -> str:
         """
         Answer a question about a YouTube video transcript.
@@ -212,6 +213,27 @@ class RAGPipeline:
                 "HuggingFace API not configured. Please set HUGGINGFACEHUB_API_TOKEN in .env"
             )
         
+        if transcript and transcript.strip():
+            print(f"📥 Using transcript supplied by extension for {video_id}...")
+            chunks = await asyncio.get_event_loop().run_in_executor(
+                None,
+                self._split_text,
+                transcript.strip()
+            )
+            if not chunks:
+                raise ValueError("No content found in provided transcript")
+
+            vectorstore = await asyncio.get_event_loop().run_in_executor(
+                None,
+                self._create_vectorstore,
+                chunks
+            )
+            self.cache[video_id] = {
+                "vectorstore": vectorstore,
+                "transcript": transcript.strip(),
+                "chunks": chunks
+            }
+
         # Check cache first
         if video_id not in self.cache:
             print(f"📥 Processing video {video_id}...")

@@ -33,9 +33,11 @@ const backendStatusEl = document.getElementById('backendStatus');
 // State management
 let currentVideoId = null;
 let currentVideoUrl = null;
+let currentTabId = null;
 let isLoading = false;
 let lastRequestTime = 0;
 let chatHistory = [];
+let lastChatVideoId = null;
 
 async function fetchWithTimeout(url, options = {}, timeoutMs = 30000) {
   const controller = new AbortController();
@@ -49,23 +51,61 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 30000) {
 
 function applyVideoPayload(payload) {
   if (payload?.videoId) {
+    const previousVideoId = currentVideoId;
     currentVideoId = payload.videoId;
     currentVideoUrl = payload.videoUrl || null;
+    currentTabId = payload.tabId ?? currentTabId;
     videoTitleEl.textContent = payload.videoTitle || 'YouTube Video';
     videoIdEl.textContent = `ID: ${payload.videoId}`;
     videoIdEl.style.display = 'block';
     questionInputEl.disabled = false;
     askButtonEl.disabled = false;
+
+    // Prevent answers from older videos appearing under the new video's header.
+    if (previousVideoId && previousVideoId !== payload.videoId) {
+      clearChatHistory();
+    }
+    lastChatVideoId = payload.videoId;
+
     console.info('[SidePanel] Video:', payload.videoId, payload.videoTitle);
   } else {
     currentVideoId = null;
     currentVideoUrl = null;
+    currentTabId = null;
+    lastChatVideoId = null;
     videoTitleEl.textContent = 'No video selected';
     videoIdEl.textContent = '';
     videoIdEl.style.display = 'none';
     questionInputEl.disabled = true;
     askButtonEl.disabled = true;
   }
+}
+
+function getTranscriptFromActiveTab() {
+  return new Promise((resolve) => {
+    if (!currentTabId) {
+      resolve(null);
+      return;
+    }
+
+    chrome.tabs.sendMessage(currentTabId, { type: 'YT_GET_TRANSCRIPT' }, (response) => {
+      if (chrome.runtime.lastError) {
+        console.warn('[SidePanel] YT_GET_TRANSCRIPT:', chrome.runtime.lastError.message);
+        resolve(null);
+        return;
+      }
+
+      if (response?.ok && response.transcript) {
+        resolve(response.transcript);
+        return;
+      }
+
+      if (response?.error) {
+        console.warn('[SidePanel] Transcript fetch unavailable:', response.error);
+      }
+      resolve(null);
+    });
+  });
 }
 
 /**
@@ -224,9 +264,16 @@ async function handleAsk() {
   clearError();
   
   try {
+    if (lastChatVideoId && lastChatVideoId !== currentVideoId) {
+      clearChatHistory();
+    }
+    lastChatVideoId = currentVideoId;
+
     // Add user message to chat history
     addMessageToHistory('user', question);
     questionInputEl.value = '';
+
+    const transcript = await getTranscriptFromActiveTab();
     
     // Call backend
     const response = await fetchWithTimeout(`${BACKEND_URL}/ask`, {
@@ -237,7 +284,8 @@ async function handleAsk() {
       body: JSON.stringify({
         video_id: currentVideoId,
         video_url: currentVideoUrl,
-        question: question
+        question: question,
+        transcript: transcript
       })
     }, ASK_TIMEOUT_MS);
     
