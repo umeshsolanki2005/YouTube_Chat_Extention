@@ -138,44 +138,29 @@ function extractJsonArrayByMarker(text, marker) {
   return null;
 }
 
-function extractCaptionTracksFromHtml(htmlText) {
-  if (!htmlText || !htmlText.includes('captionTracks')) {
-    return [];
-  }
-
+function extractCaptionTracksFromDocument() {
+  const scripts = Array.from(document.scripts || []);
   const markers = [
     '"captionTracks":',
     '"captionTracks" :',
   ];
 
-  for (const marker of markers) {
-    const jsonArray = extractJsonArrayByMarker(htmlText, marker);
-    if (!jsonArray) continue;
+  for (const script of scripts) {
+    const text = script.textContent || '';
+    if (!text.includes('captionTracks')) continue;
 
-    try {
-      const tracks = JSON.parse(jsonArray);
-      if (Array.isArray(tracks) && tracks.length > 0) {
-        return tracks;
+    for (const marker of markers) {
+      const jsonArray = extractJsonArrayByMarker(text, marker);
+      if (!jsonArray) continue;
+
+      try {
+        const tracks = JSON.parse(jsonArray);
+        if (Array.isArray(tracks) && tracks.length > 0) {
+          return tracks;
+        }
+      } catch (error) {
+        // Keep scanning other scripts.
       }
-    } catch (error) {
-      // Keep scanning other markers.
-    }
-  }
-
-  return [];
-}
-
-function extractCaptionTracksFromDocument() {
-  const htmlCandidates = [
-    document.documentElement?.outerHTML || '',
-    document.body?.innerHTML || '',
-    ...Array.from(document.scripts || []).map((script) => script.textContent || ''),
-  ];
-
-  for (const htmlText of htmlCandidates) {
-    const tracks = extractCaptionTracksFromHtml(htmlText);
-    if (tracks.length > 0) {
-      return tracks;
     }
   }
 
@@ -228,17 +213,6 @@ async function fetchTranscriptFromCaptionTrack(track) {
   return transcript;
 }
 
-async function fetchCurrentPageHtml() {
-  const response = await fetch(window.location.href, {
-    method: 'GET',
-    credentials: 'include',
-  });
-  if (!response.ok) {
-    throw new Error(`page html request failed with ${response.status}`);
-  }
-  return response.text();
-}
-
 async function fetchTranscriptForCurrentVideo() {
   const videoId = getVideoIdFromUrl(window.location.href);
   if (!videoId) {
@@ -249,15 +223,8 @@ async function fetchTranscriptForCurrentVideo() {
     return transcriptCache.transcript;
   }
 
-  let tracks = extractCaptionTracksFromDocument();
-  let selectedTrack = pickCaptionTrack(tracks);
-
-  if (!selectedTrack) {
-    const fetchedHtml = await fetchCurrentPageHtml();
-    tracks = extractCaptionTracksFromHtml(fetchedHtml);
-    selectedTrack = pickCaptionTrack(tracks);
-  }
-
+  const tracks = extractCaptionTracksFromDocument();
+  const selectedTrack = pickCaptionTrack(tracks);
   if (!selectedTrack) {
     throw new Error('no caption tracks found on page');
   }
