@@ -13,8 +13,13 @@ import html
 import os
 import re
 import json
+import shutil
+import subprocess
+import sys
+import tempfile
 import xml.etree.ElementTree as ET
 from collections import Counter
+from pathlib import Path
 from typing import Dict, List, Optional
 
 import requests
@@ -514,57 +519,7 @@ class RAGPipeline:
 
         raise ValueError("Timedtext tracks exist but transcript fetch returned empty content")
 
-    def _fetch_transcript_ytdlp(self, video_id: str) -> str:
-        """
-        Use yt-dlp metadata to find subtitle/caption URLs and fetch transcript text.
-        """
-        try:
-            from yt_dlp import YoutubeDL
-        except Exception as exc:
-            raise ValueError("yt-dlp is not installed") from exc
-
-        watch_url = f"https://www.youtube.com/watch?v={video_id}"
-        ydl_opts = {
-            "quiet": True,
-            "skip_download": True,
-            "no_warnings": True,
-            "socket_timeout": 20,
-            "proxy": os.getenv("YT_TRANSCRIPT_PROXY_HTTPS") or os.getenv("YT_TRANSCRIPT_PROXY_HTTP") or "",
-        }
-        with YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(watch_url, download=False)
-
-        if not info:
-            raise ValueError("yt-dlp did not return video info")
-
-        subtitles = info.get("subtitles") or {}
-        auto_caps = info.get("automatic_captions") or {}
-
-        def pick_track(group: dict) -> Optional[dict]:
-            # Prefer English keys first
-            preferred_keys = []
-            for k in group.keys():
-                if str(k).lower().startswith("en"):
-                    preferred_keys.append(k)
-            preferred_keys += [k for k in group.keys() if k not in preferred_keys]
-
-            for key in preferred_keys:
-                tracks = group.get(key) or []
-                # Prefer vtt/json3 if available
-                ordered = sorted(tracks, key=lambda x: 0 if x.get("ext") in ("vtt", "json3") else 1)
-                for tr in ordered:
-                    if tr.get("url"):
-                        return tr
-            return None
-
-        track = pick_track(subtitles) or pick_track(auto_caps)
-        if not track:
-            raise ValueError("yt-dlp found no subtitle or auto-caption URL")
-
-        sub_resp = self._http_get(track["url"], headers=self._youtube_headers(), timeout=20)
-        sub_resp.raise_for_status()
-        body = sub_resp.text
-
+    def _subtitle_body_to_transcript(self, body: str) -> str:
         # VTT cleaning
         if "WEBVTT" in body[:100]:
             lines = []
@@ -578,7 +533,6 @@ class RAGPipeline:
                     continue
                 if "-->" in line:
                     continue
-                # remove inline tags and cue settings
                 line = re.sub(r"<[^>]+>", "", line)
                 line = re.sub(r"\{[^}]+\}", "", line)
                 line = re.sub(r"\s+", " ", line).strip()
@@ -617,7 +571,70 @@ class RAGPipeline:
         if transcript:
             return transcript
 
-        raise ValueError("yt-dlp caption payload did not yield transcript text")
+        raise ValueError("subtitle payload did not yield transcript text")
+
+    def _fetch_transcript_ytdlp(self, video_id: str) -> str:
+        """
+        Use yt-dlp subtitle download mode:
+        yt-dlp --write-auto-subs --sub-lang en --skip-download <watch_url>
+        """
+        watch_url = f"https://www.youtube.com/watch?v={video_id}"
+        cmd = ["yt-dlp"]
+        if shutil.which("yt-dlp") is None:
+            cmd = [sys.executable, "-m", "yt_dlp"]
+
+        with tempfile.TemporaryDirectory(prefix="yt-rag-subs-") as tmpdir:
+            output_template = str(Path(tmpdir) / "%(id)s.%(ext)s")
+            full_cmd = cmd + [
+                "--write-auto-subs",
+                "--write-subs",
+                "--sub-lang", "en.*",
+                "--sub-format", "json3/vtt/best",
+                "--skip-download",
+                "--no-warnings",
+                "--no-playlist",
+                "--output", output_template,
+                watch_url,
+            ]
+
+            env = os.environ.copy()
+            proxy = os.getenv("YT_TRANSCRIPT_PROXY_HTTPS") or os.getenv("YT_TRANSCRIPT_PROXY_HTTP")
+            if proxy:
+                env["http_proxy"] = proxy
+                env["https_proxy"] = proxy
+
+            result = subprocess.run(
+                full_cmd,
+                capture_output=True,
+                text=True,
+                timeout=40,
+                check=False,
+                env=env,
+            )
+            if result.returncode != 0:
+                stderr = (result.stderr or result.stdout or "").strip()
+                raise ValueError(stderr or "yt-dlp subtitle download failed")
+
+            subtitle_files = sorted(
+                Path(tmpdir).glob(f"{video_id}*"),
+                key=lambda p: (0 if p.suffix.lower() == ".json3" else 1 if p.suffix.lower() == ".vtt" else 2, p.name),
+            )
+            if not subtitle_files:
+                raise ValueError("yt-dlp did not download any subtitle files")
+
+            for subtitle_file in subtitle_files:
+                try:
+                    body = subtitle_file.read_text(encoding="utf-8", errors="ignore")
+                except Exception:
+                    continue
+                try:
+                    transcript = self._subtitle_body_to_transcript(body)
+                    if transcript:
+                        return transcript
+                except Exception:
+                    continue
+
+        raise ValueError("yt-dlp subtitle download completed but transcript parsing failed")
 
     def _split_text(self, text: str) -> List[str]:
         text = re.sub(r"\s+", " ", text).strip()
