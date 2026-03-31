@@ -18,6 +18,7 @@ from collections import Counter
 from typing import Dict, List, Optional
 
 import requests
+from dotenv import load_dotenv
 from huggingface_hub import InferenceClient
 from openai import OpenAI
 from youtube_transcript_api import YouTubeTranscriptApi
@@ -28,6 +29,8 @@ from youtube_transcript_api._errors import (
     VideoUnavailable,
 )
 from youtube_transcript_api.proxies import GenericProxyConfig
+
+load_dotenv()
 
 
 STOPWORDS = {
@@ -52,6 +55,9 @@ class RAGPipeline:
 
         self.openrouter_client: Optional[OpenAI] = None
         self.hf_client: Optional[InferenceClient] = None
+        self.http = requests.Session()
+        # Ignore ambient HTTP(S)_PROXY vars unless transcript proxying is explicitly configured.
+        self.http.trust_env = False
 
         self.request_timeout_seconds = int(os.getenv("CLOUD_REQUEST_TIMEOUT_SECONDS", "55"))
         self.transcript_timeout_seconds = int(os.getenv("TRANSCRIPT_TIMEOUT_SECONDS", "35"))
@@ -82,11 +88,21 @@ class RAGPipeline:
         raise ValueError("LLM_PROVIDER must be 'openrouter' or 'huggingface' in cloud mode")
 
     def _build_youtube_transcript_api(self) -> YouTubeTranscriptApi:
-        http_proxy = os.getenv("YT_TRANSCRIPT_PROXY_HTTP") or os.getenv("HTTP_PROXY") or os.getenv("http_proxy")
-        https_proxy = os.getenv("YT_TRANSCRIPT_PROXY_HTTPS") or os.getenv("HTTPS_PROXY") or os.getenv("https_proxy")
+        http_proxy = os.getenv("YT_TRANSCRIPT_PROXY_HTTP")
+        https_proxy = os.getenv("YT_TRANSCRIPT_PROXY_HTTPS")
         if http_proxy or https_proxy:
             return YouTubeTranscriptApi(proxy_config=GenericProxyConfig(http_url=http_proxy, https_url=https_proxy))
         return YouTubeTranscriptApi()
+
+    def _configured_proxies(self) -> Optional[dict]:
+        http_proxy = os.getenv("YT_TRANSCRIPT_PROXY_HTTP")
+        https_proxy = os.getenv("YT_TRANSCRIPT_PROXY_HTTPS")
+        if not http_proxy and not https_proxy:
+            return None
+        return {
+            "http": http_proxy or https_proxy,
+            "https": https_proxy or http_proxy,
+        }
 
     def _youtube_headers(self) -> dict:
         return {
@@ -95,6 +111,22 @@ class RAGPipeline:
                 "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
             )
         }
+
+    def _http_get(self, url: str, **kwargs):
+        headers = kwargs.pop("headers", None) or self._youtube_headers()
+        timeout = kwargs.pop("timeout", 20)
+        proxies = kwargs.pop("proxies", None)
+        if proxies is None:
+            proxies = self._configured_proxies()
+        return self.http.get(url, headers=headers, timeout=timeout, proxies=proxies, **kwargs)
+
+    def _http_post(self, url: str, **kwargs):
+        headers = kwargs.pop("headers", None) or self._youtube_headers()
+        timeout = kwargs.pop("timeout", 20)
+        proxies = kwargs.pop("proxies", None)
+        if proxies is None:
+            proxies = self._configured_proxies()
+        return self.http.post(url, headers=headers, timeout=timeout, proxies=proxies, **kwargs)
 
     async def ensure_video_processed(self, video_id: str, video_url: str) -> bool:
         current = self.cache.get(video_id)
@@ -249,7 +281,7 @@ class RAGPipeline:
         watch_url = f"https://www.youtube.com/watch?v={video_id}"
         headers = self._youtube_headers()
 
-        page = requests.get(watch_url, headers=headers, timeout=20)
+        page = self._http_get(watch_url, headers=headers, timeout=20)
         page.raise_for_status()
         html_text = page.text
 
@@ -270,7 +302,7 @@ class RAGPipeline:
         if not base_url:
             raise ValueError("No baseUrl in selected caption track")
 
-        xml_resp = requests.get(base_url, headers=headers, timeout=20)
+        xml_resp = self._http_get(base_url, headers=headers, timeout=20)
         xml_resp.raise_for_status()
         xml_text = xml_resp.text
 
@@ -303,7 +335,7 @@ class RAGPipeline:
                 }
             },
         }
-        resp = requests.post(url, json=payload, headers=self._youtube_headers(), timeout=20)
+        resp = self._http_post(url, json=payload, headers=self._youtube_headers(), timeout=20)
         resp.raise_for_status()
         data = resp.json()
         tracks = (
@@ -326,7 +358,7 @@ class RAGPipeline:
         if not base_url:
             raise ValueError("youtubei track missing baseUrl")
 
-        xml_resp = requests.get(base_url, headers=self._youtube_headers(), timeout=20)
+        xml_resp = self._http_get(base_url, headers=self._youtube_headers(), timeout=20)
         xml_resp.raise_for_status()
         text_elements = re.findall(r"<text[^>]*>(.*?)</text>", xml_resp.text, flags=re.DOTALL)
         cleaned = []
@@ -370,7 +402,7 @@ class RAGPipeline:
         2) request transcript XML by lang (and kind when present)
         """
         list_url = "https://www.youtube.com/api/timedtext"
-        list_resp = requests.get(
+        list_resp = self._http_get(
             list_url,
             params={"type": "list", "v": video_id},
             timeout=20,
@@ -409,7 +441,7 @@ class RAGPipeline:
             params = {"v": video_id, "lang": lang}
             if kind:
                 params["kind"] = kind
-            resp = requests.get(list_url, params=params, timeout=20)
+            resp = self._http_get(list_url, params=params, timeout=20)
             if resp.status_code != 200:
                 continue
 
@@ -442,6 +474,7 @@ class RAGPipeline:
             "skip_download": True,
             "no_warnings": True,
             "socket_timeout": 20,
+            "proxy": os.getenv("YT_TRANSCRIPT_PROXY_HTTPS") or os.getenv("YT_TRANSCRIPT_PROXY_HTTP") or "",
         }
         with YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(watch_url, download=False)
@@ -473,7 +506,7 @@ class RAGPipeline:
         if not track:
             raise ValueError("yt-dlp found no subtitle or auto-caption URL")
 
-        sub_resp = requests.get(track["url"], headers=self._youtube_headers(), timeout=20)
+        sub_resp = self._http_get(track["url"], headers=self._youtube_headers(), timeout=20)
         sub_resp.raise_for_status()
         body = sub_resp.text
 
@@ -636,7 +669,7 @@ class RAGPipeline:
 
             # Try oEmbed first
             try:
-                oembed = requests.get(
+                oembed = self._http_get(
                     "https://www.youtube.com/oembed",
                     params={"url": watch_url, "format": "json"},
                     headers=self._youtube_headers(),
@@ -651,7 +684,7 @@ class RAGPipeline:
 
             # Fallback to watch page meta tags
             try:
-                page = requests.get(watch_url, headers=self._youtube_headers(), timeout=15)
+                page = self._http_get(watch_url, headers=self._youtube_headers(), timeout=15)
                 if page.ok:
                     html_text = page.text
                     m_title = re.search(r'<meta\s+name="title"\s+content="([^"]*)"', html_text)
