@@ -124,16 +124,16 @@ async def ask_question(request: AskRequest) -> AskResponse:
                 f"This is a common issue with YouTube's transcript service. "
                 f"The suggestions above usually help resolve it."
             )
-        elif "HuggingFace API not configured" in error_msg:
+        elif "LLM provider not configured" in error_msg:
             detail = (
                 f"Configuration Error: {error_msg}\n\n"
-                f"Please set up your HUGGINGFACEHUB_API_TOKEN in the .env file "
-                f"in the backend directory."
+                f"Please check LLM_PROVIDER and the matching API key in the "
+                f".env file in the backend directory."
             )
-        elif "Error generating answer from HuggingFace" in error_msg:
+        elif "Error generating answer from" in error_msg:
             detail = (
                 f"AI Generation Error: {error_msg}\n\n"
-                f"Please check your HuggingFace API token and internet connection, "
+                f"Please check your configured LLM provider credentials and internet connection, "
                 f"then try again."
             )
         else:
@@ -150,17 +150,17 @@ async def get_status():
     return {
         "status": "running",
         "cached_videos": len(rag_pipeline.cache),
-        "llm_configured": rag_pipeline.is_huggingface_configured
+        "llm_configured": rag_pipeline.is_llm_configured,
+        "llm_provider": rag_pipeline.llm_provider
     }
 
 if __name__ == "__main__":
     import uvicorn
     
-    # Check if HuggingFace API token is configured
-    if not os.getenv('HUGGINGFACEHUB_API_TOKEN'):
+    if os.getenv("LLM_PROVIDER", "ollama").strip().lower() == "openrouter" and not os.getenv("OPENROUTER_API_KEY"):
         print("⚠️  WARNING: HUGGINGFACEHUB_API_TOKEN not set in .env file")
-        print("   The backend will fail when trying to generate answers.")
-        print("   Please add your HuggingFace API token to .env")
+        print("The backend will fail when trying to generate answers.")
+        print("Please add your OpenRouter API key to .env")
     
     print("🚀 Starting YouTube RAG Backend...")
     print("📍 Server: http://localhost:8000")

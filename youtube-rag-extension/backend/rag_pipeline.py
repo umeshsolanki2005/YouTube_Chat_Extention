@@ -21,6 +21,7 @@ if hasattr(sys.stdout, "reconfigure"):
 
 import os
 from typing import Optional
+from hashlib import sha256
 from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api.proxies import GenericProxyConfig
 from youtube_transcript_api._errors import TranscriptsDisabled, NoTranscriptFound, VideoUnavailable, RequestBlocked, IpBlocked
@@ -39,6 +40,70 @@ from urllib.parse import urlparse, parse_qs
 import html
 from bs4 import BeautifulSoup
 from googleapiclient.discovery import build
+
+
+class HashEmbeddings:
+    """Deterministic local embeddings fallback that does not require model downloads."""
+
+    def __init__(self, dimension: int = 256):
+        self.dimension = dimension
+
+    def _embed_text(self, text: str) -> list[float]:
+        vector = [0.0] * self.dimension
+        for token in re.findall(r"\w+", text.lower()):
+            digest = sha256(token.encode("utf-8")).digest()
+            bucket = int.from_bytes(digest[:2], "big") % self.dimension
+            sign = 1.0 if digest[2] % 2 == 0 else -1.0
+            weight = 1.0 + (digest[3] / 255.0)
+            vector[bucket] += sign * weight
+
+        norm = sum(value * value for value in vector) ** 0.5
+        if norm:
+            vector = [value / norm for value in vector]
+        return vector
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return [self._embed_text(text) for text in texts]
+
+    def embed_query(self, text: str) -> list[float]:
+        return self._embed_text(text)
+
+
+class OpenRouterLLM:
+    """Minimal OpenRouter client compatible with the pipeline's invoke interface."""
+
+    def __init__(self, api_key: str, model: str, temperature: float = 0.2):
+        self.api_key = api_key
+        self.model = model
+        self.temperature = temperature
+
+    def invoke(self, prompt: str) -> str:
+        response = requests.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": self.model,
+                "temperature": self.temperature,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": (
+                            "You answer questions about a YouTube transcript using only "
+                            "the provided context. If the answer is not in the transcript, "
+                            "say so clearly."
+                        ),
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+            },
+            timeout=60,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        return payload["choices"][0]["message"]["content"].strip()
 
 class RAGPipeline:
     """
@@ -75,8 +140,9 @@ class RAGPipeline:
         self.embeddings = None
         self.llm = None
         self.youtube_api = None
-        self.is_huggingface_configured = False
+        self.is_llm_configured = False
         self.is_youtube_api_configured = False
+        self.llm_provider = "unconfigured"
         self._initialize_models()
     
     def _build_youtube_transcript_api(self) -> YouTubeTranscriptApi:
@@ -145,6 +211,53 @@ class RAGPipeline:
         return len(word_like) >= 8
     
     def _initialize_models(self):
+        """Initialize embeddings and the configured LLM provider."""
+        try:
+            self.embeddings = HuggingFaceEmbeddings(
+                model_name="sentence-transformers/all-MiniLM-L6-v2",
+                model_kwargs={'device': 'cpu'},
+                encode_kwargs={'normalize_embeddings': True}
+            )
+            print("Embeddings model loaded")
+        except Exception as e:
+            print(f"Falling back to local hash embeddings: {str(e)}")
+            self.embeddings = HashEmbeddings()
+
+        self.llm_provider = os.getenv("LLM_PROVIDER", "ollama").strip().lower()
+
+        try:
+            if self.llm_provider == "openrouter":
+                openrouter_api_key = os.getenv("OPENROUTER_API_KEY")
+                openrouter_model = os.getenv(
+                    "OPENROUTER_MODEL",
+                    "meta-llama/llama-3.2-3b-instruct:free"
+                )
+                if not openrouter_api_key:
+                    raise ValueError("OPENROUTER_API_KEY is missing. Set it in backend/.env.")
+
+                self.llm = OpenRouterLLM(
+                    api_key=openrouter_api_key,
+                    model=openrouter_model,
+                    temperature=0.2,
+                )
+                self.is_llm_configured = True
+                print(f"OpenRouter LLM initialized: {openrouter_model}")
+            else:
+                self.llm = OllamaLLM(
+                    model=os.getenv("OLLAMA_MODEL", "llama3.2"),
+                    temperature=0.7,
+                    num_ctx=4096
+                )
+                self.llm.invoke("Hello")
+                self.llm_provider = "ollama"
+                self.is_llm_configured = True
+                print("Ollama LLM initialized successfully")
+        except Exception as e:
+            print(f"Error initializing LLM provider '{self.llm_provider}': {str(e)}")
+            self.llm = None
+            self.is_llm_configured = False
+
+        return
         """Initialize Ollama local LLM and embeddings"""
         try:
             # Initialize embeddings (using local model)
@@ -234,9 +347,10 @@ class RAGPipeline:
         Raises:
             ValueError: If transcript unavailable or models not initialized
         """
-        if not self.is_huggingface_configured:
+        if not self.is_llm_configured:
             raise ValueError(
-                "HuggingFace API not configured. Please set HUGGINGFACEHUB_API_TOKEN in .env"
+                f"LLM provider not configured. Current provider: {self.llm_provider}. "
+                "Check the backend .env API key and provider settings."
             )
         
         if transcript and transcript.strip():
@@ -894,7 +1008,7 @@ Answer:"""
         except Exception as e:
             print(f"❌ Error generating answer: {str(e)}")
             raise ValueError(
-                f"Error generating answer from HuggingFace: {str(e)}"
+                f"Error generating answer from {self.llm_provider}: {str(e)}"
             )
     
     def _call_llm(self, prompt: str) -> str:
