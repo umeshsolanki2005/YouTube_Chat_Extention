@@ -183,6 +183,20 @@ async def ask_question(request: AskRequest):
         )
     except Exception as e:
         message = str(e)
+        lower_message = message.lower()
+        if (
+            "429" in message
+            or "rate limit" in lower_message
+            or "too many requests" in lower_message
+        ):
+            raise HTTPException(
+                status_code=429,
+                detail=(
+                    f"Rate Limit Error: {message}\n\n"
+                    "The configured AI provider is temporarily rate-limited. "
+                    "Please wait a few seconds and try again."
+                ),
+            )
         if "being prepared in background" in message:
             raise HTTPException(status_code=503, detail=message)
         raise HTTPException(status_code=500, detail=message)

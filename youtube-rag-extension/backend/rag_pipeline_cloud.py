@@ -13,10 +13,12 @@ import html
 import os
 import re
 import json
+import random
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import xml.etree.ElementTree as ET
 from collections import Counter
 from pathlib import Path
@@ -66,6 +68,8 @@ class RAGPipeline:
 
         self.request_timeout_seconds = int(os.getenv("CLOUD_REQUEST_TIMEOUT_SECONDS", "55"))
         self.transcript_timeout_seconds = int(os.getenv("TRANSCRIPT_TIMEOUT_SECONDS", "35"))
+        self.openrouter_max_retries = int(os.getenv("OPENROUTER_MAX_RETRIES", "3"))
+        self.openrouter_backoff_seconds = float(os.getenv("OPENROUTER_BACKOFF_SECONDS", "1.5"))
         self._initialize_clients()
 
     def _initialize_clients(self) -> None:
@@ -746,23 +750,102 @@ class RAGPipeline:
     def _call_llm(self, prompt: str) -> str:
         if self.llm_provider == "openrouter":
             model = os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.2-3b-instruct:free")
-            completion = self.openrouter_client.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.2,
-                max_tokens=500,
-            )
-            return completion.choices[0].message.content.strip()
+            last_exc = None
+            for attempt in range(self.openrouter_max_retries + 1):
+                try:
+                    completion = self.openrouter_client.chat.completions.create(
+                        model=model,
+                        messages=[{"role": "user", "content": prompt}],
+                        temperature=0.2,
+                        max_tokens=500,
+                    )
+                    content = completion.choices[0].message.content
+                    if not content or not str(content).strip():
+                        raise ValueError("openrouter returned empty completion content")
+                    return str(content).strip()
+                except Exception as exc:
+                    last_exc = exc
+                    text = str(exc).lower()
+                    status = getattr(exc, "status_code", None)
+                    is_rate_limited = (
+                        status == 429
+                        or "429" in text
+                        or "rate limit" in text
+                        or "too many requests" in text
+                    )
+
+                    if is_rate_limited:
+                        if attempt < self.openrouter_max_retries:
+                            backoff = self.openrouter_backoff_seconds * (2 ** attempt) + random.uniform(0.1, 0.8)
+                            print(
+                                f"OpenRouter rate-limited (429). Retrying in {backoff:.1f}s "
+                                f"({attempt + 1}/{self.openrouter_max_retries})..."
+                            )
+                            time.sleep(backoff)
+                            continue
+                        raise ValueError(
+                            "openrouter rate limit exceeded (429). "
+                            "Please retry in a moment or switch to a different provider/model."
+                        ) from exc
+
+                    if attempt < self.openrouter_max_retries:
+                        backoff = self.openrouter_backoff_seconds * (2 ** attempt) + random.uniform(0.1, 0.8)
+                        print(
+                            f"OpenRouter request failed ({type(exc).__name__}). "
+                            f"Retrying in {backoff:.1f}s ({attempt + 1}/{self.openrouter_max_retries})..."
+                        )
+                        time.sleep(backoff)
+                        continue
+                    break
+
+            raise ValueError(f"openrouter request failed: {last_exc}") from last_exc
 
         model = os.getenv("HUGGINGFACE_MODEL", "HuggingFaceH4/zephyr-7b-beta")
-        result = self.hf_client.text_generation(
-            prompt,
-            model=model,
-            max_new_tokens=400,
-            temperature=0.2,
-            do_sample=False,
-        )
-        return str(result).strip()
+        try:
+            result = self.hf_client.text_generation(
+                prompt,
+                model=model,
+                max_new_tokens=400,
+                temperature=0.2,
+                do_sample=False,
+            )
+            text = str(result).strip()
+            if text:
+                return text
+        except Exception as exc:
+            err = str(exc).lower()
+            supports_conversation_only = (
+                "not supported for task text-generation" in err
+                or "supported task: conversational" in err
+            )
+            if not supports_conversation_only:
+                raise
+
+            chat_result = self.hf_client.chat_completion(
+                model=model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You answer questions about a YouTube transcript using only "
+                            "the provided context. If the answer is not in the transcript, "
+                            "say so clearly."
+                        ),
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.2,
+                max_tokens=400,
+            )
+            choices = getattr(chat_result, "choices", None) or []
+            if choices:
+                message = getattr(choices[0], "message", None)
+                content = getattr(message, "content", "") if message else ""
+                text = str(content).strip()
+                if text:
+                    return text
+
+        raise ValueError("huggingface returned empty completion content")
 
     def _extractive_fallback_answer(self, question: str, context_chunks: List[str], err: Exception) -> str:
         """

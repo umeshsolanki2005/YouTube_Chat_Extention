@@ -116,6 +116,21 @@ async def ask_question(request: AskRequest) -> AskResponse:
     except Exception as e:
         error_msg = str(e)
         print(f"Error processing question: {error_msg}")
+        lower_error = error_msg.lower()
+
+        if (
+            "429" in error_msg
+            or "rate limit" in lower_error
+            or "too many requests" in lower_error
+        ):
+            raise HTTPException(
+                status_code=429,
+                detail=(
+                    f"Rate Limit Error: {error_msg}\n\n"
+                    "The configured AI provider is temporarily rate-limited. "
+                    "Please wait a few seconds and try again."
+                ),
+            )
         
         # Provide more user-friendly error messages
         if "Unable to retrieve transcript" in error_msg:

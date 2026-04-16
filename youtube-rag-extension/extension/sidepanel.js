@@ -8,9 +8,8 @@
  * - Loading and error states
  */
 
-// Backend URL - Update this after deploying to Render
-// const BACKEND_URL = 'http://localhost:8000'; // Local development
-const BACKEND_URL = 'https://youtube-rag-bot.onrender.com'; // Production
+const DEFAULT_LOCAL_BACKEND_URL = 'http://127.0.0.1:8000';
+let backendUrl = DEFAULT_LOCAL_BACKEND_URL;
 
 const DEBOUNCE_DELAY = 1000;
 const HEALTH_TIMEOUT_MS = 8000;
@@ -38,6 +37,31 @@ let isLoading = false;
 let lastRequestTime = 0;
 let chatHistory = [];
 let lastChatVideoId = null;
+
+function normalizeBackendUrl(url) {
+  return (url || DEFAULT_LOCAL_BACKEND_URL).trim().replace(/\/+$/, '');
+}
+
+function loadBackendUrl() {
+  return new Promise((resolve) => {
+    chrome.storage.sync.get(['backendUrl', 'mode'], (result) => {
+      if (chrome.runtime.lastError) {
+        backendUrl = DEFAULT_LOCAL_BACKEND_URL;
+        resolve(backendUrl);
+        return;
+      }
+
+      const mode = result.mode === 'cloud' ? 'cloud' : 'local';
+      const storedUrl =
+        mode === 'cloud'
+          ? result.backendUrl || DEFAULT_LOCAL_BACKEND_URL
+          : DEFAULT_LOCAL_BACKEND_URL;
+
+      backendUrl = normalizeBackendUrl(storedUrl);
+      resolve(backendUrl);
+    });
+  });
+}
 
 async function fetchWithTimeout(url, options = {}, timeoutMs = 30000) {
   const controller = new AbortController();
@@ -171,7 +195,8 @@ setInterval(() => {
 // Check if backend is running
 async function checkBackendHealth() {
   try {
-    const response = await fetchWithTimeout(`${BACKEND_URL}/health`, {}, HEALTH_TIMEOUT_MS);
+    const resolvedBackendUrl = await loadBackendUrl();
+    const response = await fetchWithTimeout(`${resolvedBackendUrl}/health`, {}, HEALTH_TIMEOUT_MS);
     if (response.ok) {
       backendReachable = true;
       if (!isLoading) {
@@ -200,7 +225,7 @@ async function checkBackendHealth() {
       statusBadgeEl.textContent = 'Backend offline';
       statusBadgeEl.classList.add('error');
     }
-    backendStatusEl.textContent = '✗ Backend not reachable at ' + BACKEND_URL;
+    backendStatusEl.textContent = '✗ Backend not reachable at ' + backendUrl;
     backendStatusEl.classList.add('error');
   }
 }
@@ -276,7 +301,8 @@ async function handleAsk() {
     const transcript = await getTranscriptFromActiveTab();
     
     // Call backend
-    const response = await fetchWithTimeout(`${BACKEND_URL}/ask`, {
+    const resolvedBackendUrl = await loadBackendUrl();
+    const response = await fetchWithTimeout(`${resolvedBackendUrl}/ask`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -311,10 +337,10 @@ async function handleAsk() {
     if (error.message.includes('initializing') || error.message.includes('503')) {
       errorMsg = 'Backend is still starting up. Please wait 30 seconds and try again.';
     } else if (error.name === 'AbortError') {
-      errorMsg = 'Request timed out while waiting for backend response. Render free instances can be slow to wake up. Please try again.';
+      errorMsg = `Request timed out while waiting for backend response from ${backendUrl}. Please try again.`;
       backendReachable = false;
     } else if (error.message.includes('Failed to fetch') || error.message.includes('ERR_CONNECTION_RESET')) {
-      errorMsg = `Cannot connect to backend at ${BACKEND_URL}. Make sure the Python FastAPI server is running.`;
+      errorMsg = `Cannot connect to backend at ${backendUrl}. Make sure the Python FastAPI server is running.`;
       backendReachable = false;
     } else if (error.message.includes('Transcript Error')) {
       // Extract the transcript error and provide actionable suggestions

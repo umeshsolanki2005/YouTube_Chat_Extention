@@ -30,6 +30,8 @@ from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_ollama import OllamaLLM
 from langchain_core.prompts import PromptTemplate
+from langchain_core.embeddings import Embeddings
+from huggingface_hub import InferenceClient
 import asyncio
 import requests
 import re
@@ -42,7 +44,7 @@ from bs4 import BeautifulSoup
 from googleapiclient.discovery import build
 
 
-class HashEmbeddings:
+class HashEmbeddings(Embeddings):
     """Deterministic local embeddings fallback that does not require model downloads."""
 
     def __init__(self, dimension: int = 256):
@@ -68,42 +70,176 @@ class HashEmbeddings:
     def embed_query(self, text: str) -> list[float]:
         return self._embed_text(text)
 
+    def __call__(self, text: str) -> list[float]:
+        """Compatibility shim for vectorstores that call embedding_function(query)."""
+        return self.embed_query(text)
+
 
 class OpenRouterLLM:
     """Minimal OpenRouter client compatible with the pipeline's invoke interface."""
 
-    def __init__(self, api_key: str, model: str, temperature: float = 0.2):
+    def __init__(
+        self,
+        api_key: str,
+        model: str,
+        temperature: float = 0.2,
+        max_retries: int = 3,
+        base_backoff_seconds: float = 1.5,
+    ):
         self.api_key = api_key
+        self.model = model
+        self.temperature = temperature
+        self.max_retries = max(0, max_retries)
+        self.base_backoff_seconds = max(0.2, base_backoff_seconds)
+
+    def invoke(self, prompt: str) -> str:
+        session = requests.Session()
+        session.trust_env = False
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        body = {
+            "model": self.model,
+            "temperature": self.temperature,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You answer questions about a YouTube transcript using only "
+                        "the provided context. If the answer is not in the transcript, "
+                        "say so clearly."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
+        }
+
+        last_error = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                response = session.post(
+                    "https://openrouter.ai/api/v1/chat/completions",
+                    headers=headers,
+                    json=body,
+                    timeout=60,
+                )
+                if response.status_code == 429:
+                    if attempt < self.max_retries:
+                        backoff = self.base_backoff_seconds * (2 ** attempt) + random.uniform(0.1, 0.8)
+                        print(
+                            f"OpenRouter rate-limited (429). Retrying in {backoff:.1f}s "
+                            f"({attempt + 1}/{self.max_retries})..."
+                        )
+                        time.sleep(backoff)
+                        continue
+                    raise ValueError(
+                        "openrouter rate limit exceeded (429). "
+                        "Please retry in a moment or switch to a different provider/model."
+                    )
+
+                response.raise_for_status()
+                payload = response.json()
+                choices = payload.get("choices") or []
+                if not choices:
+                    raise ValueError("openrouter returned no completion choices")
+                message = choices[0].get("message") or {}
+                content = (message.get("content") or "").strip()
+                if not content:
+                    raise ValueError("openrouter returned empty completion content")
+                return content
+            except requests.exceptions.RequestException as exc:
+                last_error = exc
+                if attempt < self.max_retries:
+                    backoff = self.base_backoff_seconds * (2 ** attempt) + random.uniform(0.1, 0.8)
+                    print(
+                        f"OpenRouter request failed ({type(exc).__name__}). "
+                        f"Retrying in {backoff:.1f}s ({attempt + 1}/{self.max_retries})..."
+                    )
+                    time.sleep(backoff)
+                    continue
+                break
+
+        if last_error is not None:
+            raise ValueError(f"openrouter request failed: {last_error}") from last_error
+        raise ValueError("openrouter request failed for an unknown reason")
+
+
+class HuggingFaceLLM:
+    """Minimal Hugging Face Inference client with invoke interface."""
+
+    def __init__(self, api_token: str, model: str, temperature: float = 0.2):
+        self.client = InferenceClient(token=api_token)
         self.model = model
         self.temperature = temperature
 
     def invoke(self, prompt: str) -> str:
-        response = requests.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": self.model,
-                "temperature": self.temperature,
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": (
-                            "You answer questions about a YouTube transcript using only "
-                            "the provided context. If the answer is not in the transcript, "
-                            "say so clearly."
-                        ),
-                    },
-                    {"role": "user", "content": prompt},
-                ],
-            },
-            timeout=60,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        return payload["choices"][0]["message"]["content"].strip()
+        blocked = {
+            "http://127.0.0.1:9",
+            "https://127.0.0.1:9",
+            "http://localhost:9",
+            "https://localhost:9",
+        }
+        proxy_keys = ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"]
+        removed = {}
+        for key in proxy_keys:
+            value = (os.getenv(key) or "").strip().lower()
+            if value in blocked:
+                removed[key] = os.environ.pop(key, None)
+
+        try:
+            try:
+                result = self.client.text_generation(
+                    prompt=prompt,
+                    model=self.model,
+                    max_new_tokens=500,
+                    temperature=self.temperature,
+                    do_sample=False,
+                    return_full_text=False,
+                )
+                text = str(result).strip()
+                if text:
+                    return text
+            except Exception as exc:
+                err = str(exc).lower()
+                supports_conversation_only = (
+                    "not supported for task text-generation" in err
+                    or "supported task: conversational" in err
+                )
+                if not supports_conversation_only:
+                    raise
+
+                chat_result = self.client.chat_completion(
+                    model=self.model,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": (
+                                "You answer questions about a YouTube transcript using only "
+                                "the provided context. If the answer is not in the transcript, "
+                                "say so clearly."
+                            ),
+                        },
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=self.temperature,
+                    max_tokens=500,
+                )
+                choices = getattr(chat_result, "choices", None) or []
+                if choices:
+                    message = getattr(choices[0], "message", None)
+                    content = getattr(message, "content", "") if message else ""
+                    text = str(content).strip()
+                    if text:
+                        return text
+
+                raise ValueError("huggingface returned empty chat completion content")
+        finally:
+            for key, value in removed.items():
+                if value is not None:
+                    os.environ[key] = value
+
+        raise ValueError("huggingface returned empty completion content")
 
 class RAGPipeline:
     """
@@ -144,6 +280,85 @@ class RAGPipeline:
         self.is_youtube_api_configured = False
         self.llm_provider = "unconfigured"
         self._initialize_models()
+
+    def _create_llm_for_provider(self, provider: str):
+        """Create an LLM client for a specific provider or raise ValueError."""
+        selected = (provider or "").strip().lower()
+        if selected == "openrouter":
+            api_key = os.getenv("OPENROUTER_API_KEY")
+            if not api_key:
+                raise ValueError("OPENROUTER_API_KEY is missing")
+            model = os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.2-3b-instruct:free")
+            return OpenRouterLLM(
+                api_key=api_key,
+                model=model,
+                temperature=0.2,
+                max_retries=int(os.getenv("OPENROUTER_MAX_RETRIES", "3")),
+                base_backoff_seconds=float(os.getenv("OPENROUTER_BACKOFF_SECONDS", "1.5")),
+            )
+
+        if selected == "huggingface":
+            token = (
+                os.getenv("HUGGINGFACEHUB_API_TOKEN")
+                or os.getenv("HF_TOKEN")
+                or os.getenv("HUGGINGFACE_API_KEY")
+            )
+            if not token:
+                raise ValueError("huggingface token is missing")
+            model = os.getenv("HUGGINGFACE_MODEL", "HuggingFaceH4/zephyr-7b-beta")
+            return HuggingFaceLLM(
+                api_token=token,
+                model=model,
+                temperature=0.2,
+            )
+
+        if selected == "ollama":
+            llm = OllamaLLM(
+                model=os.getenv("OLLAMA_MODEL", "llama3.2"),
+                temperature=0.7,
+                num_ctx=4096,
+            )
+            # Validate connectivity once so we can fail over immediately if unavailable.
+            llm.invoke("Hello")
+            return llm
+
+        raise ValueError(f"unsupported llm provider: {provider}")
+
+    def _call_llm_with_failover(self, prompt: str) -> str:
+        """Call current LLM and transparently fail over to other configured providers."""
+        preferred = (self.llm_provider or "").strip().lower()
+        candidates = [preferred, "openrouter", "huggingface", "ollama"]
+        providers = []
+        for provider in candidates:
+            if provider and provider not in providers:
+                providers.append(provider)
+
+        errors = []
+        for provider in providers:
+            try:
+                llm = self.llm if provider == preferred and self.llm is not None else self._create_llm_for_provider(provider)
+                response = llm.invoke(prompt)
+                if isinstance(response, str):
+                    answer = response.strip()
+                elif hasattr(response, "content"):
+                    answer = str(response.content).strip()
+                else:
+                    answer = str(response).strip()
+                if not answer:
+                    raise ValueError("empty completion content")
+
+                # Promote successful provider for subsequent requests.
+                self.llm = llm
+                self.llm_provider = provider
+                self.is_llm_configured = True
+                if provider != preferred:
+                    print(f"Switched active LLM provider from '{preferred}' to '{provider}'")
+                return answer
+            except Exception as exc:
+                errors.append(f"{provider}: {exc}")
+                continue
+
+        raise ValueError("All configured LLM providers failed. " + " | ".join(errors))
     
     def _build_youtube_transcript_api(self) -> YouTubeTranscriptApi:
         """
@@ -162,6 +377,17 @@ class RAGPipeline:
             or os.getenv("HTTPS_PROXY")
             or os.getenv("https_proxy")
         )
+
+        blocked = {
+            "http://127.0.0.1:9",
+            "https://127.0.0.1:9",
+            "http://localhost:9",
+            "https://localhost:9",
+        }
+        if (http_proxy or "").strip().lower() in blocked:
+            http_proxy = None
+        if (https_proxy or "").strip().lower() in blocked:
+            https_proxy = None
 
         proxy_config = None
         if http_proxy or https_proxy:
@@ -192,6 +418,17 @@ class RAGPipeline:
             or os.getenv("HTTPS_PROXY")
             or os.getenv("https_proxy")
         )
+        blocked = {
+            "http://127.0.0.1:9",
+            "https://127.0.0.1:9",
+            "http://localhost:9",
+            "https://localhost:9",
+        }
+        if (http_proxy or "").strip().lower() in blocked:
+            http_proxy = None
+        if (https_proxy or "").strip().lower() in blocked:
+            https_proxy = None
+
         if not http_proxy and not https_proxy:
             return None
         return {"http": http_proxy or https_proxy, "https": https_proxy or http_proxy}
@@ -212,7 +449,24 @@ class RAGPipeline:
     
     def _initialize_models(self):
         """Initialize embeddings and the configured LLM provider."""
+        def has_blocking_proxy() -> bool:
+            candidates = [
+                os.getenv("HTTP_PROXY"),
+                os.getenv("HTTPS_PROXY"),
+                os.getenv("http_proxy"),
+                os.getenv("https_proxy"),
+            ]
+            blocked = {
+                "http://127.0.0.1:9",
+                "https://127.0.0.1:9",
+                "http://localhost:9",
+                "https://localhost:9",
+            }
+            return any((value or "").strip().lower() in blocked for value in candidates)
+
         try:
+            if has_blocking_proxy():
+                raise RuntimeError("blocking proxy detected; skipping remote embedding download")
             self.embeddings = HuggingFaceEmbeddings(
                 model_name="sentence-transformers/all-MiniLM-L6-v2",
                 model_kwargs={'device': 'cpu'},
@@ -239,9 +493,34 @@ class RAGPipeline:
                     api_key=openrouter_api_key,
                     model=openrouter_model,
                     temperature=0.2,
+                    max_retries=int(os.getenv("OPENROUTER_MAX_RETRIES", "3")),
+                    base_backoff_seconds=float(os.getenv("OPENROUTER_BACKOFF_SECONDS", "1.5")),
                 )
                 self.is_llm_configured = True
                 print(f"OpenRouter LLM initialized: {openrouter_model}")
+            elif self.llm_provider == "huggingface":
+                hf_api_token = (
+                    os.getenv("HUGGINGFACEHUB_API_TOKEN")
+                    or os.getenv("HF_TOKEN")
+                    or os.getenv("HUGGINGFACE_API_KEY")
+                )
+                hf_model = os.getenv(
+                    "HUGGINGFACE_MODEL",
+                    "HuggingFaceH4/zephyr-7b-beta"
+                )
+                if not hf_api_token:
+                    raise ValueError(
+                        "Hugging Face API token missing. Set one of: "
+                        "HUGGINGFACEHUB_API_TOKEN, HF_TOKEN, or HUGGINGFACE_API_KEY."
+                    )
+
+                self.llm = HuggingFaceLLM(
+                    api_token=hf_api_token,
+                    model=hf_model,
+                    temperature=0.2,
+                )
+                self.is_llm_configured = True
+                print(f"Hugging Face LLM initialized: {hf_model}")
             else:
                 self.llm = OllamaLLM(
                     model=os.getenv("OLLAMA_MODEL", "llama3.2"),
@@ -266,7 +545,7 @@ class RAGPipeline:
                 model_kwargs={'device': 'cpu'},
                 encode_kwargs={'normalize_embeddings': True}
             )
-            print("✓ Embeddings model loaded")
+            print("? Embeddings model loaded")
             
             # Initialize Ollama LLM
             try:
@@ -278,29 +557,29 @@ class RAGPipeline:
                 # Test the LLM
                 test_response = self.llm.invoke("Hello")
                 self.is_huggingface_configured = True
-                print("✓ Ollama LLM (llama3.2) initialized successfully")
+                print("? Ollama LLM (llama3.2) initialized successfully")
             except Exception as e:
-                print(f"⚠️  Ollama LLM failed: {e}")
+                print(f"??  Ollama LLM failed: {e}")
                 print("   Make sure Ollama is running: ollama serve")
                 self.llm = self._create_mock_llm()
                 self.is_huggingface_configured = True
                 
         except Exception as e:
-            print(f"❌ Error initializing models: {str(e)}")
+            print(f"? Error initializing models: {str(e)}")
             self.is_huggingface_configured = False
         
         # Initialize YouTube Data API
         try:
             youtube_api_key = os.getenv('YOUTUBE_DATA_API_KEY')
             if not youtube_api_key:
-                print("⚠️  YouTube Data API key not found in environment")
+                print("??  YouTube Data API key not found in environment")
                 return
             
             self.youtube_api = build('youtube', 'v3', developerKey=youtube_api_key)
             self.is_youtube_api_configured = True
-            print("✓ YouTube Data API initialized successfully")
+            print("? YouTube Data API initialized successfully")
         except Exception as e:
-            print(f"❌ Error initializing YouTube Data API: {str(e)}")
+            print(f"? Error initializing YouTube Data API: {str(e)}")
             self.is_youtube_api_configured = False
     
     def _create_mock_llm(self):
@@ -332,7 +611,7 @@ class RAGPipeline:
         
         Process:
         1. Check cache for existing vectorstore
-        2. If not cached: fetch transcript → chunk → embed → create vectorstore
+        2. If not cached: fetch transcript ? chunk ? embed ? create vectorstore
         3. Retrieve relevant chunks using similarity
         4. Generate answer using Gemini with retrieved context
         
@@ -354,7 +633,7 @@ class RAGPipeline:
             )
         
         if transcript and transcript.strip():
-            print(f"📥 Using transcript supplied by extension for {video_id}...")
+            print(f"?? Using transcript supplied by extension for {video_id}...")
             chunks = await asyncio.get_event_loop().run_in_executor(
                 None,
                 self._split_text,
@@ -376,10 +655,10 @@ class RAGPipeline:
 
         # Check cache first
         if video_id not in self.cache:
-            print(f"📥 Processing video {video_id}...")
+            print(f"?? Processing video {video_id}...")
             await self._process_video(video_id, video_url)
         else:
-            print(f"✓ Using cached data for video {video_id}")
+            print(f"? Using cached data for video {video_id}")
         
         # Retrieve relevant chunks
         vectorstore = self.cache[video_id]["vectorstore"]
@@ -408,7 +687,7 @@ class RAGPipeline:
         loop = asyncio.get_event_loop()
         
         # Fetch transcript
-        print(f"  ⬇️  Fetching transcript...")
+        print(f"  ??  Fetching transcript...")
         transcript_text = await loop.run_in_executor(
             None,
             self._fetch_transcript,
@@ -416,7 +695,7 @@ class RAGPipeline:
         )
         
         # Split into chunks
-        print(f"  ✂️  Splitting into chunks...")
+        print(f"  ??  Splitting into chunks...")
         chunks = await loop.run_in_executor(
             None,
             self._split_text,
@@ -427,7 +706,7 @@ class RAGPipeline:
             raise ValueError(f"No content found in transcript")
         
         # Create vectorstore
-        print(f"  🧠 Creating embeddings and vector store...")
+        print(f"  ?? Creating embeddings and vector store...")
         vectorstore = await loop.run_in_executor(
             None,
             self._create_vectorstore,
@@ -441,7 +720,7 @@ class RAGPipeline:
             "chunks": chunks
         }
         
-        print(f"✓ Video {video_id} processed: {len(chunks)} chunks cached")
+        print(f"? Video {video_id} processed: {len(chunks)} chunks cached")
     
     def _fetch_transcript(self, video_id: str) -> str:
         """
@@ -461,19 +740,19 @@ class RAGPipeline:
             try:
                 return self._fetch_transcript_youtube_data_api(video_id)
             except Exception as e:
-                print(f"  ⚠️  YouTube Data API failed: {str(e)}")
+                print(f"  ??  YouTube Data API failed: {str(e)}")
         
         # Strategy 1: Try youtube-transcript-api with different language preferences
         try:
             return self._fetch_transcript_youtube_api(video_id)
         except Exception as e:
-            print(f"  ⚠️  YouTube API failed: {str(e)}")
+            print(f"  ??  YouTube API failed: {str(e)}")
         
         # Strategy 2: Try with auto-generated captions
         try:
             return self._fetch_transcript_auto_generated(video_id)
         except Exception as e:
-            print(f"  ⚠️  Auto-generated captions failed: {str(e)}")
+            print(f"  ??  Auto-generated captions failed: {str(e)}")
         
         # Strategy 3: External hosted transcript API
         try:
@@ -485,19 +764,19 @@ class RAGPipeline:
         try:
             return self._fetch_transcript_web_scraping(video_id)
         except Exception as e:
-            print(f"  ⚠️  Web scraping failed: {str(e)}")
+            print(f"  ??  Web scraping failed: {str(e)}")
         
         # Strategy 4: YouTube internal API method
         try:
             return self._fetch_transcript_internal_api(video_id)
         except Exception as e:
-            print(f"  ⚠️  Internal API failed: {str(e)}")
+            print(f"  ??  Internal API failed: {str(e)}")
         
         # Strategy 5: Try with different proxy/user agent approach
         try:
             return self._fetch_transcript_with_retry(video_id)
         except Exception as e:
-            print(f"  ⚠️  Retry approach failed: {str(e)}")
+            print(f"  ??  Retry approach failed: {str(e)}")
         
         # All strategies failed
         raise ValueError(
@@ -530,35 +809,30 @@ class RAGPipeline:
         
         for languages in language_combinations:
             try:
-                transcript_text = ""
-                get_transcript = getattr(YouTubeTranscriptApi, "get_transcript", None)
-
-                if callable(get_transcript):
-                    try:
-                        fetched = get_transcript(video_id, languages=list(languages))
-                        transcript_text = self._join_transcript_segments(fetched)
-                        if transcript_text.strip():
-                            print(f"  ✓ Transcript fetched using YouTubeTranscriptApi.get_transcript: {languages}")
-                            return transcript_text
-                    except Exception:
-                        transcript_text = ""
-
                 ytt = self._build_youtube_transcript_api()
                 fetched = ytt.fetch(video_id, languages=languages)
                 transcript_text = self._join_transcript_segments(fetched)
-                
                 if transcript_text.strip():
-                    print(f"  ✓ Transcript fetched using languages: {languages}")
+                    print(f"  ? Transcript fetched using languages: {languages}")
                     return transcript_text
-                    
+
+                # Backward compatibility for older youtube-transcript-api versions.
+                get_transcript = getattr(YouTubeTranscriptApi, "get_transcript", None)
+                if callable(get_transcript):
+                    fetched = get_transcript(video_id, languages=list(languages))
+                    transcript_text = self._join_transcript_segments(fetched)
+                    if transcript_text.strip():
+                        print(f"  ? Transcript fetched using legacy get_transcript: {languages}")
+                        return transcript_text
+
             except (TranscriptsDisabled, NoTranscriptFound, VideoUnavailable):
                 continue
             except (RequestBlocked, IpBlocked):
                 raise
             except Exception:
                 continue
-        
-        raise NoTranscriptFound(f"No transcript found for video {video_id}")
+
+        raise ValueError(f"No transcript found for video {video_id}")
 
     def _fetch_transcript_external_api(self, video_id: str) -> str:
         watch_url = f"https://www.youtube.com/watch?v={video_id}"
@@ -585,7 +859,7 @@ class RAGPipeline:
                 transcript = (data.get("transcript") or "").strip()
                 if not self._looks_like_valid_transcript(transcript):
                     raise ValueError("external transcript API returned invalid transcript content")
-                print("  ✓ Transcript fetched using external transcript API")
+                print("  ? Transcript fetched using external transcript API")
                 return transcript
             except Exception as exc:
                 last_error = exc
@@ -599,7 +873,7 @@ class RAGPipeline:
         
         try:
             # Get list of available transcripts
-            transcript_list = ytt.list_transcripts(video_id)
+            transcript_list = ytt.list(video_id)
             
             # Try to find auto-generated English transcript
             try:
@@ -607,7 +881,7 @@ class RAGPipeline:
                 fetched = transcript.fetch()
                 transcript_text = " ".join(s.text for s in fetched)
                 if transcript_text.strip():
-                    print(f"  ✓ Manual transcript fetched")
+                    print(f"  ? Manual transcript fetched")
                     return transcript_text
             except:
                 pass
@@ -618,7 +892,7 @@ class RAGPipeline:
                 fetched = transcript.fetch()
                 transcript_text = " ".join(s.text for s in fetched)
                 if transcript_text.strip():
-                    print(f"  ✓ Auto-generated transcript fetched")
+                    print(f"  ? Auto-generated transcript fetched")
                     return transcript_text
             except:
                 pass
@@ -629,15 +903,15 @@ class RAGPipeline:
                 fetched = transcript.fetch()
                 transcript_text = " ".join(s.text for s in fetched)
                 if transcript_text.strip():
-                    print(f"  ✓ Any available transcript fetched")
+                    print(f"  ? Any available transcript fetched")
                     return transcript_text
             except:
                 pass
                 
         except Exception as e:
             raise Exception(f"Auto-generated transcript fetch failed: {str(e)}")
-        
-        raise NoTranscriptFound(f"No auto-generated transcript found for video {video_id}")
+
+        raise ValueError(f"No auto-generated transcript found for video {video_id}")
     
     def _fetch_transcript_with_retry(self, video_id: str) -> str:
         """Retry with exponential backoff and random delays"""
@@ -649,7 +923,7 @@ class RAGPipeline:
                 # Add random delay to avoid rate limiting
                 if attempt > 0:
                     delay = base_delay * (2 ** attempt) + random.uniform(0.5, 2.0)
-                    print(f"  ⏳ Retry attempt {attempt + 1}/{max_retries} after {delay:.1f}s delay...")
+                    print(f"  ? Retry attempt {attempt + 1}/{max_retries} after {delay:.1f}s delay...")
                     time.sleep(delay)
                 
                 # Try the primary method again
@@ -658,12 +932,12 @@ class RAGPipeline:
             except (RequestBlocked, IpBlocked) as e:
                 if attempt == max_retries - 1:
                     raise e
-                print(f"  ⚠️  Rate blocked, waiting before retry...")
+                print(f"  ??  Rate blocked, waiting before retry...")
                 
             except Exception as e:
                 if attempt == max_retries - 1:
                     raise e
-                print(f"  ⚠️  Attempt {attempt + 1} failed, retrying...")
+                print(f"  ??  Attempt {attempt + 1} failed, retrying...")
         
         raise Exception(f"All {max_retries} retry attempts failed")
     
@@ -680,7 +954,7 @@ class RAGPipeline:
                 raise ValueError(f"Video {video_id} not found")
             
             video = video_response['items'][0]
-            print(f"  📹 Found video: {video['snippet']['title']}")
+            print(f"  ?? Found video: {video['snippet']['title']}")
             
             # Get caption tracks for this video
             captions_response = self.youtube_api.captions().list(
@@ -702,7 +976,7 @@ class RAGPipeline:
             if not english_caption:
                 # Try any available caption if English not found
                 english_caption = captions_response['items'][0]
-                print(f"  ⚠️  Using {english_caption['snippet']['language']} captions (English not available)")
+                print(f"  ??  Using {english_caption['snippet']['language']} captions (English not available)")
             
             # Download the caption content
             caption_download_url = english_caption['snippet']['downloadUrl']
@@ -736,7 +1010,7 @@ class RAGPipeline:
                 raise ValueError("No valid transcript content found")
             
             transcript_text = ' '.join(transcript_parts)
-            print(f"  ✓ YouTube Data API transcript fetched ({len(transcript_parts)} segments)")
+            print(f"  ? YouTube Data API transcript fetched ({len(transcript_parts)} segments)")
             
             return transcript_text
             
@@ -814,7 +1088,7 @@ class RAGPipeline:
                                     
                                     if transcript_text:
                                         full_transcript = ' '.join(transcript_text)
-                                        print(f"  ✓ Web scraping transcript fetched")
+                                        print(f"  ? Web scraping transcript fetched")
                                         return full_transcript
                                         
                     except json.JSONDecodeError:
@@ -878,7 +1152,7 @@ class RAGPipeline:
                             
                             if transcript_text:
                                 full_transcript = ' '.join(transcript_text)
-                                print(f"  ✓ Internal API transcript fetched")
+                                print(f"  ? Internal API transcript fetched")
                                 return full_transcript
                                 
             except (KeyError, IndexError):
@@ -909,7 +1183,7 @@ class RAGPipeline:
                                         
                                         if transcript_text:
                                             full_transcript = ' '.join(transcript_text)
-                                            print(f"  ✓ Internal API transcript fetched")
+                                            print(f"  ? Internal API transcript fetched")
                                             return full_transcript
                 except (KeyError, IndexError):
                     pass
@@ -999,36 +1273,63 @@ Answer:"""
             # Call LLM synchronously in executor to avoid blocking
             response = await loop.run_in_executor(
                 None,
-                self._call_llm,
+                self._call_llm_with_failover,
                 formatted_prompt
             )
             
             return response
             
         except Exception as e:
-            print(f"❌ Error generating answer: {str(e)}")
+            print(f"Error generating answer: {str(e)}")
+            fallback = self._extractive_fallback_answer(question, docs, e)
+            if fallback:
+                return fallback
             raise ValueError(
                 f"Error generating answer from {self.llm_provider}: {str(e)}"
             )
-    
-    def _call_llm(self, prompt: str) -> str:
-        """
-        Call LLM synchronously.
-        
-        Args:
-            prompt: Formatted prompt with context
-            
-        Returns:
-            LLM response text
-        """
-        response = self.llm.invoke(prompt)
-        # Handle both string responses and object responses with content attribute
-        if isinstance(response, str):
-            return response
-        elif hasattr(response, 'content'):
-            return response.content
-        else:
-            return str(response)
+
+    def _extractive_fallback_answer(self, question: str, docs: list, err: Exception) -> str:
+        """Best-effort answer from transcript chunks when provider APIs fail."""
+        if not docs:
+            return ""
+
+        question_tokens = {
+            token.lower()
+            for token in re.findall(r"[A-Za-z0-9']+", question)
+            if len(token) > 2
+        }
+
+        best_chunk = ""
+        best_score = -1
+        for doc in docs:
+            text = (getattr(doc, "page_content", "") or "").strip()
+            if not text:
+                continue
+            tokens = re.findall(r"[A-Za-z0-9']+", text.lower())
+            score = sum(1 for token in tokens if token in question_tokens)
+            if score > best_score:
+                best_score = score
+                best_chunk = text
+
+        snippet = best_chunk or (getattr(docs[0], "page_content", "") or "").strip()
+        if not snippet:
+            return ""
+
+        snippet = re.sub(r"\s+", " ", snippet)
+        if len(snippet) > 700:
+            snippet = snippet[:700].rstrip() + "..."
+
+        error_text = str(err).lower()
+        if "429" in error_text or "rate limit" in error_text or "too many requests" in error_text:
+            return (
+                "OpenRouter is currently rate-limited, so this answer is from transcript context:\n\n"
+                f"{snippet}"
+            )
+
+        return (
+            "AI generation is temporarily unavailable, so here is the most relevant transcript context:\n\n"
+            f"{snippet}"
+        )
     
     def clear_cache(self, video_id: Optional[str] = None):
         """
@@ -1040,10 +1341,10 @@ Answer:"""
         if video_id:
             if video_id in self.cache:
                 del self.cache[video_id]
-                print(f"✓ Cleared cache for video {video_id}")
+                print(f"? Cleared cache for video {video_id}")
         else:
             self.cache.clear()
-            print("✓ Cleared all cache")
+            print("? Cleared all cache")
     
     def get_cache_info(self) -> dict:
         """Get information about current cache"""
@@ -1051,3 +1352,4 @@ Answer:"""
             "cached_videos": len(self.cache),
             "videos": list(self.cache.keys())
         }
+

@@ -139,6 +139,27 @@ function extractJsonArrayByMarker(text, marker) {
 }
 
 function extractCaptionTracksFromDocument() {
+  const playerResponseSources = [
+    window.ytInitialPlayerResponse,
+    window.ytplayer?.config?.args?.player_response,
+    window.ytplayer?.bootstrapWebPlayerContextConfig?.jsUrl ? window.ytInitialPlayerResponse : null,
+  ];
+
+  for (const source of playerResponseSources) {
+    if (!source) continue;
+
+    try {
+      const playerResponse = typeof source === 'string' ? JSON.parse(source) : source;
+      const tracks =
+        playerResponse?.captions?.playerCaptionsTracklistRenderer?.captionTracks || [];
+      if (Array.isArray(tracks) && tracks.length > 0) {
+        return tracks;
+      }
+    } catch (error) {
+      // Fall through to DOM script scanning.
+    }
+  }
+
   const scripts = Array.from(document.scripts || []);
   const markers = [
     '"captionTracks":',
@@ -223,8 +244,14 @@ async function fetchTranscriptForCurrentVideo() {
     return transcriptCache.transcript;
   }
 
-  const tracks = extractCaptionTracksFromDocument();
-  const selectedTrack = pickCaptionTrack(tracks);
+  let selectedTrack = null;
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    const tracks = extractCaptionTracksFromDocument();
+    selectedTrack = pickCaptionTrack(tracks);
+    if (selectedTrack) break;
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+
   if (!selectedTrack) {
     throw new Error('no caption tracks found on page');
   }
