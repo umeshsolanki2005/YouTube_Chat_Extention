@@ -1,4 +1,4 @@
-# GEN_AI Workspace
+# GEN_AI Workspace .
 
 This repository is a local workspace for GenAI projects.
 
